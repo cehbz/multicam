@@ -50,7 +50,23 @@ if [[ $status -ne 0 || $out == *ailed* || $out == *rror* || $out == *ould\ not* 
 	exit 1
 fi
 
+netlog=$repo/captures/$body/net-$(date +%Y%m%d-%H%M%S).txt
+mkdir -p "$(dirname "$netlog")"
+netstate() {
+	{
+		echo "== $1 $(date +%T)"
+		echo "addr: $(ipconfig getifaddr "$iface")  router: $(ipconfig getoption "$iface" router)"
+		route -n get 192.168.122.1 | grep -E 'gateway|interface'
+		echo "multicast:"; route -n get 239.255.255.250 | grep -E 'gateway|interface'
+		arp -an -i "$iface"
+		for port in 8080 10000; do nc -z -G 2 -w 2 192.168.122.1 "$port" 2>&1; echo "port $port: exit $?"; done
+	} >>"$netlog" 2>&1
+}
+
+sleep 5
+netstate "after join"
 "$probe" -body "$body" -out "$repo/captures" -wait "$@"
 rc=$?
-echo "sonyprobe exited $rc"
+netstate "after probe"
+echo "sonyprobe exited $rc; network state in $netlog"
 exit $rc

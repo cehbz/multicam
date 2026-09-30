@@ -44,7 +44,7 @@ type options struct {
 func defaultOptions() options {
 	return options{
 		out:          "captures",
-		endpoint:     "http://192.168.122.1:8080/sony/camera",
+		endpoint:     "http://192.168.122.1:10000/sony/camera",
 		ssdp:         true,
 		liveview:     5 * time.Second,
 		frames:       5,

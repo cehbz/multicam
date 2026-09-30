@@ -335,3 +335,10 @@ func TestProbeFallsBackToEndpointWhenSSDPSilent(t *testing.T) {
 		t.Errorf("fallback endpoint not used:\n%s", summary)
 	}
 }
+
+// The RX10M4 and RX100M6 both serve the camera service on port 10000.
+func TestDefaultEndpointIsMeasuredPort(t *testing.T) {
+	if got, want := defaultOptions().endpoint, "http://192.168.122.1:10000/sony/camera"; got != want {
+		t.Errorf("default endpoint %q, want %q", got, want)
+	}
+}
