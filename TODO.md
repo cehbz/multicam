@@ -13,22 +13,21 @@ No flash needed:
 3. Stock-Android concurrency preview on the un-flashed Pixel 3 XL: join a
    camera AP and enable the hotspot. Framework-level signal only.
 4. RX100 mark (menu version screen or body label).
-5. AR9271 dongles: `lsusb` shows `0cf3:9271` (any Linux host).
 
 Pixel 3 XL flash: stock Android 12, Magisk, Alynx v4 crosshatch build,
 `Wireless_firmware.zip` module.
 
 After flash:
-6. `zcat /proc/config.gz`: record the shipped driver set (settles
+5. `zcat /proc/config.gz`: record the shipped driver set (settles
    MT7601U).
-7. qcacld STA+AP with an internet-less STA (manual hostapd or settings AP).
-8. Routing: hub-AP client reaches a camera subnet via iptables.
-9. Dongle on the phone: interface up, sustained STA association to a
+6. qcacld STA+AP with an internet-less STA (manual hostapd or settings AP).
+7. Routing: hub-AP client reaches a camera subnet via iptables.
+8. Dongle on the phone: interface up, sustained STA association to a
    camera AP, throughput at or above the liveview rate.
-10. Hub charge+host test per hub, including a charger plug-cycle.
+9. Hub charge+host test per hub, including a charger plug-cycle.
 
 Pixel 9 leg:
-11. Wireless-ADB re-attach script (`adb mdns services`); scrcpy from the
+10. Wireless-ADB re-attach script (`adb mdns services`); scrcpy from the
     Mac; ws-scrcpy fork against Android 16 only if dashboard embedding is
     wanted.
 
