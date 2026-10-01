@@ -3,14 +3,13 @@
 Design and findings: KB node `projects/multicam.md`.
 
 ## Stories, in order
-1. Record both cameras with one control.
-2. Clip-end auto-restart from `getEvent` recording status.
-3. Pixel 9 over wireless ADB on the home Wi-Fi: view and record.
+1. Pixel 9 over wireless ADB on the home Wi-Fi: view and record.
+2. Record all cameras with one control.
 
-Regroup after these. Candidates: exposure, focus and zoom controls (probe
-both bodies in Manual mode first for `setShutterSpeed`, `setFNumber`,
-`setFocusMode`); multi-hour power (dummy batteries in the cameras, the
-phone on a charger).
+Regroup after these. Candidates: clip-end auto-restart from `getEvent`
+recording status; exposure, focus and zoom controls (probe both bodies in
+Manual mode first for `setShutterSpeed`, `setFNumber`, `setFocusMode`);
+multi-hour power (dummy batteries in the cameras, the phone on a charger).
 
 ## Nice to have
 - Mac console over the home LAN.
