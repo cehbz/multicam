@@ -19,14 +19,44 @@ import (
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
 
-// newConsole returns a fake camera and the console for it.
-func newConsole(t *testing.T) (*sonytest.Camera, http.Handler) {
-	fake := sonytest.NewCamera(t)
-	cam, err := sony.NewCamera(fake.Endpoint(), "")
+// named returns the camera at endpoint under name.
+func named(t *testing.T, name, endpoint string) Named {
+	t.Helper()
+	cam, err := sony.NewCamera(endpoint, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return fake, New(cam)
+	return Named{Name: name, Camera: cam}
+}
+
+// newConsole returns a fake camera and the console for it alone.
+func newConsole(t *testing.T) (*sonytest.Camera, http.Handler) {
+	fake := sonytest.NewCamera(t)
+	return fake, New([]Named{named(t, "cam", fake.Endpoint())})
+}
+
+// twoCameras returns two fake cameras and the console for them as "front" and
+// "side", in that order. The side camera's frames are its own.
+func twoCameras(t *testing.T) (front, side *sonytest.Camera, console http.Handler) {
+	front, side = sonytest.NewCamera(t), sonytest.NewCamera(t)
+	side.Frames = [][]byte{[]byte("side frame 1"), []byte("side frame 2")}
+	return front, side, New([]Named{named(t, "front", front.Endpoint()), named(t, "side", side.Endpoint())})
+}
+
+// get answers a GET of target from the console.
+func get(console http.Handler, target string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	console.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+	return rec
+}
+
+// srcs lists the page's sources matching re, in page order.
+func srcs(re *regexp.Regexp, page string) []string {
+	var l []string
+	for _, m := range re.FindAllStringSubmatch(page, -1) {
+		l = append(l, m[1])
+	}
+	return l
 }
 
 var imgSrc = regexp.MustCompile(`<img src="([^"]+)"`)
@@ -255,7 +285,7 @@ func wantControl(t *testing.T, when, doc, status string, labels ...string) {
 	}
 }
 
-func TestPageEmbedsTheControlBesideThePicture(t *testing.T) {
+func TestPageEmbedsTheControl(t *testing.T) {
 	_, console := newConsole(t)
 	streamPath(t, console)
 	doc := control(t, console, controlPath(t, console))
@@ -354,5 +384,135 @@ func TestPressLeavesTheViewersLiveviewRunning(t *testing.T) {
 	}
 	if calls := fake.Calls(); slices.Contains(calls, "stopLiveview@1.0") || !slices.Contains(calls, "startMovieRec@1.0") {
 		t.Errorf("camera calls %v: want startMovieRec and no stopLiveview", calls)
+	}
+}
+
+func TestPageShowsEveryCameraInOrder(t *testing.T) {
+	_, _, console := twoCameras(t)
+	rec := get(console, "/")
+	page := rec.Body.String()
+	if rec.Code != http.StatusOK || strings.Contains(page, "<script") {
+		t.Fatalf("page: status %d, or it has a script: %q", rec.Code, page)
+	}
+	if got, want := srcs(imgSrc, page), []string{"/front/liveview", "/side/liveview"}; !slices.Equal(got, want) {
+		t.Errorf("pictures %v, want %v", got, want)
+	}
+	if got, want := srcs(iframeSrc, page), []string{"/front/record", "/side/record"}; !slices.Equal(got, want) {
+		t.Errorf("record controls %v, want %v", got, want)
+	}
+	// Each name comes before its camera's picture, and the first camera's
+	// control before the second's name.
+	last := -1
+	for _, want := range []string{">front<", `src="/front/liveview"`, `src="/front/record"`, ">side<", `src="/side/liveview"`, `src="/side/record"`} {
+		i := strings.Index(page, want)
+		if i <= last {
+			t.Errorf("page lacks %s after byte %d: %q", want, last, page)
+		}
+		last = max(last, i)
+	}
+}
+
+func TestEachPictureRelaysItsOwnCamera(t *testing.T) {
+	front, side, console := twoCameras(t)
+	srv := httptest.NewServer(console)
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	for _, c := range []struct {
+		path string
+		fake *sonytest.Camera
+	}{{"/side/liveview", side}, {"/front/liveview", front}} {
+		resp, boundary := openStream(t, ctx, srv.URL+c.path)
+		parts := multipart.NewReader(resp.Body, boundary)
+		for i := range len(c.fake.Frames) + 1 {
+			p, err := parts.NextPart()
+			if err != nil {
+				t.Fatalf("%s part %d: %v", c.path, i, err)
+			}
+			if got, _ := io.ReadAll(p); !bytes.Equal(got, c.fake.Frames[i%len(c.fake.Frames)]) {
+				t.Fatalf("%s part %d is not its camera's frame %d: %.20q", c.path, i, i%len(c.fake.Frames), got)
+			}
+		}
+	}
+	for name, fake := range map[string]*sonytest.Camera{"front": front, "side": side} {
+		if got, want := fake.Calls(), []string{"startLiveview@1.0"}; !slices.Equal(got, want) {
+			t.Errorf("%s camera's calls %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestStartOnOneCameraLeavesTheOtherAlone(t *testing.T) {
+	front, side, console := twoCameras(t)
+	doc := press(t, console, control(t, console, "/side/record"))
+	wantControl(t, "side after Start", doc, "recording", "Stop")
+	wantControl(t, "front after side's Start", control(t, console, "/front/record"), "idle", "Start")
+	if got, want := side.Calls(), []string{"getEvent@1.3", "startMovieRec@1.0", "getEvent@1.3"}; !slices.Equal(got, want) {
+		t.Errorf("side camera's calls %v, want %v", got, want)
+	}
+	if got, want := front.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
+		t.Errorf("front camera's calls %v, want %v", got, want)
+	}
+}
+
+func TestUnknownCameraIsNotFound(t *testing.T) {
+	front, side, console := twoCameras(t)
+	// A request that reached a camera's liveview would run until its context
+	// ends.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for _, r := range []struct{ method, target string }{
+		{http.MethodGet, "/back/liveview"},
+		{http.MethodGet, "/back/record"},
+		{http.MethodPost, "/back/record/start"},
+		{http.MethodPost, "/back/record/stop"},
+	} {
+		rec := httptest.NewRecorder()
+		console.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, r.method, r.target, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s: status %d, want 404", r.method, r.target, rec.Code)
+		}
+	}
+	if calls := append(front.Calls(), side.Calls()...); len(calls) != 0 {
+		t.Errorf("a camera was called for an unknown name: %v", calls)
+	}
+}
+
+func TestUnreachableCameraLeavesTheOtherWorking(t *testing.T) {
+	front := sonytest.NewCamera(t)
+	gone := httptest.NewServer(http.NotFoundHandler())
+	gone.Close() // its address now refuses connections
+	console := New([]Named{named(t, "gone", gone.URL+"/sony/camera"), named(t, "front", front.Endpoint())})
+	var logged bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	log.SetOutput(&logged)
+
+	page := get(console, "/").Body.String()
+	if got, want := srcs(iframeSrc, page), []string{"/gone/record", "/front/record"}; !slices.Equal(got, want) {
+		t.Fatalf("record controls %v, want %v", got, want)
+	}
+	doc := control(t, console, "/gone/record")
+	if !strings.Contains(doc, "<p>getEvent: ") || len(buttons(doc)) != 0 {
+		t.Errorf("unreachable camera's control lacks its error or offers %v: %q", buttons(doc), doc)
+	}
+	if rec := get(console, "/gone/liveview"); rec.Code != http.StatusBadGateway {
+		t.Errorf("unreachable camera's picture: status %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	if !strings.Contains(logged.String(), "camera=gone") {
+		t.Errorf("log does not name the camera: %q", logged.String())
+	}
+
+	doc = press(t, console, control(t, console, "/front/record"))
+	wantControl(t, "front after Start", doc, "recording", "Stop")
+	srv := httptest.NewServer(console)
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	resp, boundary := openStream(t, ctx, srv.URL+"/front/liveview")
+	p, err := multipart.NewReader(resp.Body, boundary).NextPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := io.ReadAll(p); !bytes.Equal(got, front.Frames[0]) {
+		t.Errorf("front picture's first part is not its camera's first frame")
 	}
 }

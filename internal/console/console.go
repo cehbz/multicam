@@ -4,7 +4,6 @@ package console
 import (
 	"context"
 	"html/template"
-	"io"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
@@ -22,59 +21,98 @@ type Camera interface {
 	Recording(ctx context.Context) (bool, error)
 }
 
-// page shows the picture with the record control beside it, in a frame of its
-// own so that a press redraws the control alone.
-const page = `<!doctype html>
+// Named is a camera under the name the console shows it by and keys its
+// routes with.
+type Named struct {
+	Name string
+	Camera
+}
+
+// page shows each camera under its name: its picture, then its record control
+// in a frame of its own, so that a press redraws that control alone.
+var page = template.Must(template.New("page").Parse(`<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>multicam</title>
-<img src="/liveview" alt="camera liveview" style="max-width: 100%">
-<iframe src="/record" title="record control" width="320" height="240"></iframe>
-`
+{{range .}}<h2>{{.Name}}</h2>
+<img src="/{{.Name}}/liveview" alt="{{.Name}} liveview" style="display: block; max-width: 100%">
+<iframe src="/{{.Name}}/record" title="{{.Name}} record control" style="width: 100%" height="160"></iframe>
+{{end}}`))
 
-// controlDoc is the record control document: the errors of the last press and
-// of the status read, the camera's status with the button that changes it, and
-// a link that redraws the control.
+// controlDoc is one camera's record control document: the errors of the last
+// press and of the status read, the camera's status with the button that
+// changes it, and a link that redraws the control.
 var controlDoc = template.Must(template.New("control").Parse(`<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>record</title>
+<title>{{.Name}} record</title>
 <style>button { font-size: 2em; padding: .5em 1em }</style>
 {{range .Errors}}<p>{{.}}</p>
-{{end}}{{if eq .Status "recording"}}<form method="post" action="/record/stop">recording <button>Stop</button></form>
-{{else if eq .Status "idle"}}<form method="post" action="/record/start">idle <button>Start</button></form>
-{{end}}<p><a href="/record">refresh</a></p>
-`))
+{{end}}{{if eq .Status "recording"}}<form method="post" action="/{{.Name}}/record/stop">recording <button>Stop</button> <a href="/{{.Name}}/record">refresh</a></form>
+{{else if eq .Status "idle"}}<form method="post" action="/{{.Name}}/record/start">idle <button>Start</button> <a href="/{{.Name}}/record">refresh</a></form>
+{{else}}<p><a href="/{{.Name}}/record">refresh</a></p>
+{{end}}`))
 
-// New returns the console's handler for cam: the page at /, the camera's
-// liveview as MJPEG at /liveview and the record control at /record. Each
-// viewer gets its own liveview session, closed when the viewer's request ends.
-func New(cam Camera) http.Handler {
+// New returns the console's handler for cameras: the page at / and, for the
+// camera a path names, its liveview as MJPEG at /{camera}/liveview and its
+// record control at /{camera}/record. Each viewer of a picture gets its own
+// liveview session, closed when the viewer's request ends.
+func New(cameras []Named) http.Handler {
+	byName := map[string]Named{}
+	for _, cam := range cameras {
+		byName[cam.Name] = cam
+	}
+	// named serves a route of the camera its path names; 404 when none has
+	// the name.
+	named := func(serve func(http.ResponseWriter, *http.Request, Named)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			cam, ok := byName[r.PathValue("camera")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			serve(w, r, cam)
+		}
+	}
+	// command runs one record command and redirects the browser to the
+	// camera's control, with the command's error in the query when it failed.
+	command := func(name string, do func(Camera, context.Context) error) http.HandlerFunc {
+		return named(func(w http.ResponseWriter, r *http.Request, cam Named) {
+			target := "/" + url.PathEscape(cam.Name) + "/record"
+			if err := do(cam, r.Context()); err != nil {
+				slog.Error(name, "camera", cam.Name, "err", err)
+				target += "?" + url.Values{"error": {err.Error()}}.Encode()
+			}
+			http.Redirect(w, r, target, http.StatusSeeOther)
+		})
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, page)
+		page.Execute(w, cameras)
 	})
-	mux.HandleFunc("GET /liveview", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /{camera}/liveview", named(func(w http.ResponseWriter, r *http.Request, cam Named) {
 		lv, err := cam.Liveview(r.Context())
 		if err != nil {
-			slog.Error("liveview", "err", err)
+			slog.Error("liveview", "camera", cam.Name, "err", err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer lv.Close()
 		relay(w, lv)
-	})
-	mux.HandleFunc("GET /record", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("GET /{camera}/record", named(func(w http.ResponseWriter, r *http.Request, cam Named) {
 		// Status is "recording" or "idle", empty when the camera didn't say.
-		var c struct {
+		c := struct {
+			Name   string
 			Errors []string
 			Status string
-		}
+		}{Name: cam.Name}
 		if e := r.URL.Query().Get("error"); e != "" {
 			c.Errors = append(c.Errors, e)
 		}
 		switch recording, err := cam.Recording(r.Context()); {
 		case err != nil:
-			slog.Error("record status", "err", err)
+			slog.Error("record status", "camera", cam.Name, "err", err)
 			c.Errors = append(c.Errors, err.Error())
 		case recording:
 			c.Status = "recording"
@@ -84,23 +122,10 @@ func New(cam Camera) http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		controlDoc.Execute(w, c)
-	})
-	mux.Handle("POST /record/start", command(cam.StartRecording))
-	mux.Handle("POST /record/stop", command(cam.StopRecording))
+	}))
+	mux.Handle("POST /{camera}/record/start", command("record start", Camera.StartRecording))
+	mux.Handle("POST /{camera}/record/stop", command("record stop", Camera.StopRecording))
 	return mux
-}
-
-// command runs one record command and redirects the browser to the control,
-// with the command's error in the query when it failed.
-func command(do func(context.Context) error) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		target := "/record"
-		if err := do(r.Context()); err != nil {
-			slog.Error("record", "err", err)
-			target += "?" + url.Values{"error": {err.Error()}}.Encode()
-		}
-		http.Redirect(w, r, target, http.StatusSeeOther)
-	}
 }
 
 // relay writes each JPEG frame of lv as one part of a multipart/x-mixed-replace

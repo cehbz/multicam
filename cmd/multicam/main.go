@@ -58,13 +58,18 @@ func configPath(args []string) (string, error) {
 	return "", errors.New("usage: multicam [config.toml]")
 }
 
-// run serves the console for the rig's first camera on ln until ctx is done.
+// run serves the console for the rig's cameras on ln until ctx is done.
 // Requests end with ctx, and run returns once their liveview sessions have
 // closed.
 func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
-	cam := r.Cameras[0]
+	var cameras []console.Named
+	var names []string
+	for _, c := range r.Cameras {
+		cameras = append(cameras, console.Named{Name: c.Name, Camera: c.Camera})
+		names = append(names, c.Name)
+	}
 	srv := &http.Server{
-		Handler:     console.New(cam),
+		Handler:     console.New(cameras),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	stopped := make(chan error, 1)
@@ -72,7 +77,7 @@ func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
 		<-ctx.Done()
 		stopped <- srv.Shutdown(context.WithoutCancel(ctx))
 	}()
-	slog.Info("console", "url", "http://"+ln.Addr().String()+"/", "camera", cam.Name)
+	slog.Info("console", "url", "http://"+ln.Addr().String()+"/", "cameras", names)
 	if err := srv.Serve(ln); err != http.ErrServerClosed {
 		return err
 	}

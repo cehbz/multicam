@@ -69,14 +69,22 @@ func TestRunServesTheConsoleUntilStopped(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		return resp, string(body)
 	}
-	if resp, page := get("/"); resp.StatusCode != http.StatusOK || !strings.Contains(page, `<img src="/liveview"`) || !strings.Contains(page, `<iframe src="/record"`) {
-		t.Fatalf("page: %s %q, want 200 with the liveview image and the record control", resp.Status, page)
+	resp, page := get("/")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("page: %s", resp.Status)
 	}
-	if resp, control := get("/record"); resp.StatusCode != http.StatusOK || !strings.Contains(control, "<button>Start</button>") {
-		t.Fatalf("record control: %s %q, want 200 with a Start button", resp.Status, control)
+	for _, want := range []string{`<img src="/one/liveview"`, `<iframe src="/one/record"`, `<img src="/two/liveview"`, `<iframe src="/two/record"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("page lacks %s: %q", want, page)
+		}
+	}
+	for _, path := range []string{"/one/record", "/two/record"} {
+		if resp, control := get(path); resp.StatusCode != http.StatusOK || !strings.Contains(control, "<button>Start</button>") {
+			t.Fatalf("%s: %s %q, want 200 with a Start button", path, resp.Status, control)
+		}
 	}
 
-	resp, err := http.Get(base + "/liveview")
+	resp, err = http.Get(base + "/one/liveview")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +115,7 @@ func TestRunServesTheConsoleUntilStopped(t *testing.T) {
 	if got, want := fake.Calls(), []string{"getEvent@1.3", "startLiveview@1.0", "stopLiveview@1.0"}; !slices.Equal(got, want) {
 		t.Errorf("camera calls %v, want %v", got, want)
 	}
-	if got := other.Calls(); len(got) != 0 {
-		t.Errorf("the rig's second camera was called: %v", got)
+	if got, want := other.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
+		t.Errorf("second camera's calls %v, want %v", got, want)
 	}
 }
