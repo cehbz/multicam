@@ -5,6 +5,10 @@ Design and findings: KB node `projects/multicam.md`.
 ## Stories, in order
 1. Pixel 9 over wireless ADB on the home Wi-Fi: view and record.
 2. Record all cameras with one control.
+3. Keep the Pixel 3 XL awake while it is on power and the console is in
+   use: when its screen sleeps, the page's pictures freeze until it is
+   reloaded. Open: whether "in use" means the server running or the page
+   being viewed.
 
 Regroup after these. Candidates: clip-end auto-restart from `getEvent`
 recording status; exposure, focus and zoom controls (probe both bodies in
