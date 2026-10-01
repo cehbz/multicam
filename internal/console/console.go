@@ -3,13 +3,13 @@ package console
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"html/template"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"net/url"
 	"sync"
 )
 
@@ -123,35 +123,20 @@ func (g group) record(ctx context.Context, recording bool) report {
 	})
 }
 
-// page shows each camera under its name: its picture, then its record control
-// in a frame of its own, so that a press redraws that control alone.
-var page = template.Must(template.New("page").Parse(`<!doctype html>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>multicam</title>
-{{range .}}<h2>{{.Name}}</h2>
-<img src="/{{.Name}}/liveview" alt="{{.Name}} liveview" style="display: block; max-width: 100%">
-<iframe src="/{{.Name}}/record" title="{{.Name}} record control" style="width: 100%" height="160"></iframe>
-{{end}}`))
+//go:embed page.html
+var pageHTML string
 
-// controlDoc is one camera's record control document: the errors of the last
-// press and of the status read, the camera's status with the button that
-// changes it, and a link that redraws the control.
-var controlDoc = template.Must(template.New("control").Parse(`<!doctype html>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Name}} record</title>
-<style>button { font-size: 2em; padding: .5em 1em }</style>
-{{range .Errors}}<p>{{.}}</p>
-{{end}}{{if eq .Status "recording"}}<form method="post" action="/{{.Name}}/record/stop">recording <button>Stop</button> <a href="/{{.Name}}/record">refresh</a></form>
-{{else if eq .Status "idle"}}<form method="post" action="/{{.Name}}/record/start">idle <button>Start</button> <a href="/{{.Name}}/record">refresh</a></form>
-{{else}}<p><a href="/{{.Name}}/record">refresh</a></p>
-{{end}}`))
+// page tiles the cameras' pictures under the buttons that start and stop
+// them all. Its script sends a tap's command and keeps the tiles' statuses
+// current.
+var page = template.Must(template.New("page").Parse(pageHTML))
 
-// New returns the console's handler for cameras: the page at / and, for the
-// camera a path names, its liveview as MJPEG at /{camera}/liveview and its
-// record control at /{camera}/record. Each viewer of a picture gets its own
-// liveview session, closed when the viewer's request ends. For the page's
-// script, GET /status reports every camera, POST /start and POST /stop start
-// and stop them all, and POST /{camera}/start and /{camera}/stop one.
+// New returns the console's handler for cameras: the page at / and the
+// liveview of the camera a path names as MJPEG at /{camera}/liveview. Each
+// viewer of a picture gets its own liveview session, closed when the viewer's
+// request ends. For the page's script, GET /status reports every camera, POST
+// /start and POST /stop start and stop them all, and POST /{camera}/start and
+// /{camera}/stop one.
 func New(cameras []Named) http.Handler {
 	byName := map[string]Named{}
 	for _, cam := range cameras {
@@ -169,18 +154,6 @@ func New(cameras []Named) http.Handler {
 			serve(w, r, cam)
 		}
 	}
-	// command runs one record command and redirects the browser to the
-	// camera's control, with the command's error in the query when it failed.
-	command := func(name string, do func(Camera, context.Context) error) http.HandlerFunc {
-		return named(func(w http.ResponseWriter, r *http.Request, cam Named) {
-			target := "/" + url.PathEscape(cam.Name) + "/record"
-			if err := do(cam, r.Context()); err != nil {
-				slog.Error(name, "camera", cam.Name, "err", err)
-				target += "?" + url.Values{"error": {err.Error()}}.Encode()
-			}
-			http.Redirect(w, r, target, http.StatusSeeOther)
-		})
-	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -197,31 +170,6 @@ func New(cameras []Named) http.Handler {
 		defer lv.Close()
 		relay(w, lv)
 	}))
-	mux.Handle("GET /{camera}/record", named(func(w http.ResponseWriter, r *http.Request, cam Named) {
-		// Status is "recording" or "idle", empty when the camera didn't say.
-		c := struct {
-			Name   string
-			Errors []string
-			Status string
-		}{Name: cam.Name}
-		if e := r.URL.Query().Get("error"); e != "" {
-			c.Errors = append(c.Errors, e)
-		}
-		switch recording, err := cam.Recording(r.Context()); {
-		case err != nil:
-			slog.Error("record status", "camera", cam.Name, "err", err)
-			c.Errors = append(c.Errors, err.Error())
-		case recording:
-			c.Status = "recording"
-		default:
-			c.Status = "idle"
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		controlDoc.Execute(w, c)
-	}))
-	mux.Handle("POST /{camera}/record/start", command("record start", Camera.StartRecording))
-	mux.Handle("POST /{camera}/record/stop", command("record stop", Camera.StopRecording))
 
 	// The page's script: the cameras together at the root, one camera under
 	// its name. Each answers with a report as JSON.

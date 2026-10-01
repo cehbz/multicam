@@ -107,9 +107,6 @@ func TestPageShowsTheStream(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); rec.Code != http.StatusOK || !strings.HasPrefix(ct, "text/html") {
 		t.Fatalf("page: status %d, Content-Type %q; want 200 text/html", rec.Code, ct)
 	}
-	if strings.Contains(rec.Body.String(), "<script") {
-		t.Errorf("page has a script: %q", rec.Body)
-	}
 
 	srv := httptest.NewServer(console)
 	defer srv.Close()
@@ -223,145 +220,7 @@ func TestStartErrorAnswersWithErrorStatus(t *testing.T) {
 	}
 }
 
-var (
-	iframeSrc  = regexp.MustCompile(`<iframe src="([^"]+)"`)
-	formAction = regexp.MustCompile(`<form method="post" action="([^"]+)">`)
-	button     = regexp.MustCompile(`<button>([^<]+)</button>`)
-)
-
-// controlPath is the record control's route as the page embeds it.
-func controlPath(t *testing.T, console http.Handler) string {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	console.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	m := iframeSrc.FindStringSubmatch(rec.Body.String())
-	if m == nil {
-		t.Fatalf("page has no <iframe src>: %q", rec.Body)
-	}
-	return m[1]
-}
-
-// control fetches the record control document at target.
-func control(t *testing.T, console http.Handler, target string) string {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	console.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
-	if ct := rec.Header().Get("Content-Type"); rec.Code != http.StatusOK || !strings.HasPrefix(ct, "text/html") {
-		t.Fatalf("control %s: status %d, Content-Type %q; want 200 text/html", target, rec.Code, ct)
-	}
-	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
-		t.Errorf("control %s: Cache-Control %q, want no-store", target, cc)
-	}
-	if strings.Contains(rec.Body.String(), "<script") {
-		t.Errorf("control has a script: %q", rec.Body)
-	}
-	return rec.Body.String()
-}
-
-// buttons lists the control's button labels.
-func buttons(doc string) []string {
-	var labels []string
-	for _, m := range button.FindAllStringSubmatch(doc, -1) {
-		labels = append(labels, m[1])
-	}
-	return labels
-}
-
-// press submits the control's one form as a browser would, and returns the
-// document the browser ends on: the GET the command redirects to.
-func press(t *testing.T, console http.Handler, doc string) string {
-	t.Helper()
-	forms := formAction.FindAllStringSubmatch(doc, -1)
-	if len(forms) != 1 {
-		t.Fatalf("control has %d forms, want 1: %q", len(forms), doc)
-	}
-	rec := httptest.NewRecorder()
-	console.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, forms[0][1], nil))
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("POST %s: status %d, want %d", forms[0][1], rec.Code, http.StatusSeeOther)
-	}
-	return control(t, console, rec.Header().Get("Location"))
-}
-
-// wantControl checks the status the control shows and its buttons.
-func wantControl(t *testing.T, when, doc, status string, labels ...string) {
-	t.Helper()
-	if !strings.Contains(doc, status) || !slices.Equal(buttons(doc), labels) {
-		t.Errorf("%s: control lacks %q or its buttons %v are not %v: %q", when, status, buttons(doc), labels, doc)
-	}
-}
-
-func TestPageEmbedsTheControl(t *testing.T) {
-	_, console := newConsole(t)
-	streamPath(t, console)
-	doc := control(t, console, controlPath(t, console))
-	if len(buttons(doc)) == 0 {
-		t.Errorf("embedded control has no button: %q", doc)
-	}
-}
-
-func TestControlFollowsStartAndStop(t *testing.T) {
-	fake, console := newConsole(t)
-	doc := control(t, console, controlPath(t, console))
-	wantControl(t, "at first", doc, "idle", "Start")
-
-	doc = press(t, console, doc)
-	wantControl(t, "after Start", doc, "recording", "Stop")
-	if calls := fake.Calls(); !slices.Contains(calls, "startMovieRec@1.0") {
-		t.Errorf("camera calls after Start %v lack startMovieRec", calls)
-	}
-
-	doc = press(t, console, doc)
-	wantControl(t, "after Stop", doc, "idle", "Start")
-	if calls := fake.Calls(); !slices.Contains(calls, "stopMovieRec@1.0") {
-		t.Errorf("camera calls after Stop %v lack stopMovieRec", calls)
-	}
-}
-
-func TestRefusalShowsTheCameraError(t *testing.T) {
-	// The camera's message reaches the document as text, not markup.
-	const message, shown = "Not <b>Ready</b>", "camera error 40401 (Camera Not Ready): Not &lt;b&gt;Ready&lt;/b&gt;"
-	var logged bytes.Buffer
-	defer log.SetOutput(log.Writer())
-	log.SetOutput(&logged)
-
-	t.Run("start", func(t *testing.T) {
-		fake, console := newConsole(t)
-		fake.Fail("startMovieRec", 40401, message)
-		doc := press(t, console, control(t, console, controlPath(t, console)))
-		wantControl(t, "after a refused Start", doc, "idle", "Start")
-		if !strings.Contains(doc, shown) {
-			t.Errorf("control lacks %q: %q", shown, doc)
-		}
-	})
-	t.Run("stop", func(t *testing.T) {
-		fake, console := newConsole(t)
-		fake.Fail("stopMovieRec", 40401, message)
-		doc := press(t, console, control(t, console, controlPath(t, console)))
-		doc = press(t, console, doc)
-		wantControl(t, "after a refused Stop", doc, "recording", "Stop")
-		if !strings.Contains(doc, shown) {
-			t.Errorf("control lacks %q: %q", shown, doc)
-		}
-	})
-	t.Run("status", func(t *testing.T) {
-		fake, console := newConsole(t)
-		fake.Fail("getEvent", 40401, message)
-		path := controlPath(t, console)
-		doc := control(t, console, path)
-		if !strings.Contains(doc, shown) || !strings.Contains(doc, `<a href="`+path+`">`) {
-			t.Errorf("control lacks %q or a link to redraw it: %q", shown, doc)
-		}
-		if b := buttons(doc); len(b) != 0 {
-			t.Errorf("control offers %v without knowing the camera's status", b)
-		}
-	})
-	if n := strings.Count(logged.String(), "40401"); n != 3 {
-		t.Errorf("%d of the 3 refusals logged: %q", n, logged.String())
-	}
-}
-
-func TestPressLeavesTheViewersLiveviewRunning(t *testing.T) {
+func TestCommandLeavesTheViewersLiveviewRunning(t *testing.T) {
 	fake, console := newConsole(t)
 	srv := httptest.NewServer(console)
 	defer srv.Close()
@@ -383,8 +242,9 @@ func TestPressLeavesTheViewersLiveviewRunning(t *testing.T) {
 	}
 	next()
 
-	doc := press(t, console, control(t, console, controlPath(t, console)))
-	wantControl(t, "after Start", doc, "recording", "Stop")
+	if got, want := summary(ask(t, console, http.MethodPost, "/cam/start")), "cam=recording"; got != want {
+		t.Fatalf("start: report %q, want %q", got, want)
+	}
 	for range len(fake.Frames) + 1 {
 		next()
 	}
@@ -393,28 +253,61 @@ func TestPressLeavesTheViewersLiveviewRunning(t *testing.T) {
 	}
 }
 
-func TestPageShowsEveryCameraInOrder(t *testing.T) {
+var (
+	tileCamera = regexp.MustCompile(`<button class="tile" data-camera="([^"]+)">`)
+	allButton  = regexp.MustCompile(`<button id="[^"]+" aria-label="([^"]+)">`)
+	script     = regexp.MustCompile(`(?s)<script>(.*)</script>`)
+)
+
+func TestPageTilesEveryCameraInOrder(t *testing.T) {
 	_, _, console := twoCameras(t)
 	rec := get(console, "/")
 	page := rec.Body.String()
-	if rec.Code != http.StatusOK || strings.Contains(page, "<script") {
-		t.Fatalf("page: status %d, or it has a script: %q", rec.Code, page)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page: status %d", rec.Code)
+	}
+	if got, want := srcs(tileCamera, page), []string{"front", "side"}; !slices.Equal(got, want) {
+		t.Errorf("tiles %v, want %v", got, want)
 	}
 	if got, want := srcs(imgSrc, page), []string{"/front/liveview", "/side/liveview"}; !slices.Equal(got, want) {
 		t.Errorf("pictures %v, want %v", got, want)
 	}
-	if got, want := srcs(iframeSrc, page), []string{"/front/record", "/side/record"}; !slices.Equal(got, want) {
-		t.Errorf("record controls %v, want %v", got, want)
-	}
-	// Each name comes before its camera's picture, and the first camera's
-	// control before the second's name.
+	// Each tile holds its camera's picture and name, and ends before the next
+	// tile begins.
 	last := -1
-	for _, want := range []string{">front<", `src="/front/liveview"`, `src="/front/record"`, ">side<", `src="/side/liveview"`, `src="/side/record"`} {
-		i := strings.Index(page, want)
-		if i <= last {
-			t.Errorf("page lacks %s after byte %d: %q", want, last, page)
+	for _, want := range []string{
+		`data-camera="front"`, `src="/front/liveview"`, ">front<", "</button>",
+		`data-camera="side"`, `src="/side/liveview"`, ">side<", "</button>",
+	} {
+		i := strings.Index(page[last+1:], want)
+		if i < 0 {
+			t.Fatalf("page lacks %s after byte %d: %q", want, last, page)
 		}
-		last = max(last, i)
+		last += 1 + i
+	}
+}
+
+func TestPageHasTheAllButtonsAndTheScript(t *testing.T) {
+	_, _, console := twoCameras(t)
+	page := get(console, "/").Body.String()
+	if got, want := srcs(allButton, page), []string{"Start all", "Stop all"}; !slices.Equal(got, want) {
+		t.Errorf("buttons for every camera %v, want %v", got, want)
+	}
+	if i, first := strings.Index(page, `aria-label="Stop all"`), strings.Index(page, `class="tile"`); i < 0 || i > first {
+		t.Errorf("the buttons for every camera are not above the tiles: %q", page)
+	}
+	m := script.FindStringSubmatch(page)
+	if m == nil {
+		t.Fatalf("page has no script: %q", page)
+	}
+	// The script's routes.
+	for _, route := range []string{"'/status'", "'/start'", "'/stop'"} {
+		if !strings.Contains(m[1], route) {
+			t.Errorf("script lacks %s: %q", route, m[1])
+		}
+	}
+	if strings.Contains(page, "<iframe") {
+		t.Errorf("page has a frame: %q", page)
 	}
 }
 
@@ -447,19 +340,6 @@ func TestEachPictureRelaysItsOwnCamera(t *testing.T) {
 	}
 }
 
-func TestStartOnOneCameraLeavesTheOtherAlone(t *testing.T) {
-	front, side, console := twoCameras(t)
-	doc := press(t, console, control(t, console, "/side/record"))
-	wantControl(t, "side after Start", doc, "recording", "Stop")
-	wantControl(t, "front after side's Start", control(t, console, "/front/record"), "idle", "Start")
-	if got, want := side.Calls(), []string{"getEvent@1.3", "startMovieRec@1.0", "getEvent@1.3"}; !slices.Equal(got, want) {
-		t.Errorf("side camera's calls %v, want %v", got, want)
-	}
-	if got, want := front.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
-		t.Errorf("front camera's calls %v, want %v", got, want)
-	}
-}
-
 func TestUnknownCameraIsNotFound(t *testing.T) {
 	front, side, console := twoCameras(t)
 	// A request that reached a camera's liveview would run until its context
@@ -468,9 +348,8 @@ func TestUnknownCameraIsNotFound(t *testing.T) {
 	defer cancel()
 	for _, r := range []struct{ method, target string }{
 		{http.MethodGet, "/back/liveview"},
-		{http.MethodGet, "/back/record"},
-		{http.MethodPost, "/back/record/start"},
-		{http.MethodPost, "/back/record/stop"},
+		{http.MethodPost, "/back/start"},
+		{http.MethodPost, "/back/stop"},
 	} {
 		rec := httptest.NewRecorder()
 		console.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, r.method, r.target, nil))
@@ -493,12 +372,12 @@ func TestUnreachableCameraLeavesTheOtherWorking(t *testing.T) {
 	log.SetOutput(&logged)
 
 	page := get(console, "/").Body.String()
-	if got, want := srcs(iframeSrc, page), []string{"/gone/record", "/front/record"}; !slices.Equal(got, want) {
-		t.Fatalf("record controls %v, want %v", got, want)
+	if got, want := srcs(tileCamera, page), []string{"gone", "front"}; !slices.Equal(got, want) {
+		t.Fatalf("tiles %v, want %v", got, want)
 	}
-	doc := control(t, console, "/gone/record")
-	if !strings.Contains(doc, "<p>getEvent: ") || len(buttons(doc)) != 0 {
-		t.Errorf("unreachable camera's control lacks its error or offers %v: %q", buttons(doc), doc)
+	states := ask(t, console, http.MethodGet, "/status")
+	if got, want := summary(states), "gone=?! front=idle"; got != want || !strings.HasPrefix(states[0].Error, "getEvent: ") {
+		t.Errorf("report %q with the unreachable camera's error %q, want %q with its failed status read", got, states[0].Error, want)
 	}
 	if rec := get(console, "/gone/liveview"); rec.Code != http.StatusBadGateway {
 		t.Errorf("unreachable camera's picture: status %d, want %d", rec.Code, http.StatusBadGateway)
@@ -507,8 +386,9 @@ func TestUnreachableCameraLeavesTheOtherWorking(t *testing.T) {
 		t.Errorf("log does not name the camera: %q", logged.String())
 	}
 
-	doc = press(t, console, control(t, console, "/front/record"))
-	wantControl(t, "front after Start", doc, "recording", "Stop")
+	if got, want := summary(ask(t, console, http.MethodPost, "/front/start")), "front=recording"; got != want {
+		t.Errorf("front's start: report %q, want %q", got, want)
+	}
 	srv := httptest.NewServer(console)
 	defer srv.Close()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -761,6 +641,28 @@ func TestOneCamerasRefusalIsItsOwnError(t *testing.T) {
 		t.Errorf("the other camera was not started: %v", front.Calls())
 	}
 	if !strings.Contains(logged.String(), "camera=side") || !strings.Contains(logged.String(), "40401") {
+		t.Errorf("log lacks the refusal: %q", logged.String())
+	}
+}
+
+func TestRefusedStopLeavesTheCameraRecording(t *testing.T) {
+	fake, console := newConsole(t)
+	fake.Fail("stopMovieRec", 40401, "Not <b>Ready</b>")
+	var logged bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	log.SetOutput(&logged)
+
+	if got, want := summary(ask(t, console, http.MethodPost, "/cam/start")), "cam=recording"; got != want {
+		t.Fatalf("start: report %q, want %q", got, want)
+	}
+	states := ask(t, console, http.MethodPost, "/cam/stop")
+	if got, want := summary(states), "cam=recording!"; got != want {
+		t.Fatalf("stop: report %q, want %q", got, want)
+	}
+	if want := "stopMovieRec: camera error 40401 (Camera Not Ready): Not <b>Ready</b>"; states[0].Error != want {
+		t.Errorf("refusing camera's error %q, want %q", states[0].Error, want)
+	}
+	if !strings.Contains(logged.String(), "camera=cam") || !strings.Contains(logged.String(), "40401") {
 		t.Errorf("log lacks the refusal: %q", logged.String())
 	}
 }

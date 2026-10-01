@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>multicam</title>
+<style>
+html, body { height: 100%; margin: 0 }
+body { height: 100dvh; display: flex; flex-direction: column; background: #000; color: #fff; font: 13px/1.3 system-ui, sans-serif }
+button { margin: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent }
+
+/* The bar: Start all at the left, Stop all at the right, the console's own error between. */
+header { flex: none; height: 40px; display: flex; align-items: center }
+header button { height: 100%; padding: 0 14px; display: flex; align-items: center; gap: 6px }
+header button:disabled { opacity: .4 }
+header button::before { content: ""; box-sizing: border-box; width: 20px; height: 20px }
+#start::before { border: 2px solid #fff; border-radius: 50%; background: #e00 }
+#stop::before { border-radius: 2px; background: #fff }
+#fault { flex: 1; min-width: 0; overflow: hidden; text-align: center; text-overflow: ellipsis; white-space: nowrap; color: #fd0 }
+
+/* The tiles share the height under the bar; each picture is fitted whole in its tile. */
+main { flex: 1; min-height: 0; display: flex; flex-direction: column }
+.tile { flex: 1 1 0; min-height: 0; position: relative; display: block; width: 100%; overflow: hidden }
+.tile img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none }
+.name { position: absolute; top: 12px; left: 12px; padding: 1px 6px; border-radius: 3px; background: rgba(0, 0, 0, .55); font-size: 12px }
+
+/* The corner mark is what a tap does: a record disc, or a stop square while recording. */
+.mark { position: absolute; top: 12px; right: 12px; box-sizing: border-box; width: 22px; height: 22px; border: 2px solid #fff; border-radius: 50%; background: #e00; box-shadow: 0 0 0 1px rgba(0, 0, 0, .5) }
+.recording .mark { border: 0; border-radius: 3px; background: #fff; box-shadow: 0 0 0 2px rgba(0, 0, 0, .6) }
+
+/* The frame: red while recording, dashed when the camera's status is unread, pulsing while a command is outstanding. */
+.tile::after { content: ""; position: absolute; inset: 0; pointer-events: none }
+.tile.busy::after { border: 8px solid #fff; animation: pulse .5s ease-in-out infinite alternate }
+.tile.recording::after { border: 8px solid #f00 }
+.tile.recording.stale::after { border-style: dashed }
+@keyframes pulse { to { opacity: .3 } }
+
+.error { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 10px; background: rgba(0, 0, 0, .8); color: #fd0; text-align: left; white-space: pre-line; overflow-wrap: anywhere }
+.error:empty { display: none }
+</style>
+<header>
+<button id="start" aria-label="Start all">all</button>
+<output id="fault"></output>
+<button id="stop" aria-label="Stop all">all</button>
+</header>
+<main>
+{{range .}}<button class="tile" data-camera="{{.Name}}">
+<img src="/{{.Name}}/liveview" alt="{{.Name}} liveview">
+<span class="name">{{.Name}}</span>
+<span class="mark"></span>
+<span class="error"></span>
+</button>
+{{end}}</main>
+<script>
+const start = document.getElementById('start');
+const stop = document.getElementById('stop');
+const fault = document.getElementById('fault');
+
+// A tile's state: the camera's last known recording status, the refusal of
+// its last command, the error of its last status read, whether a command is
+// outstanding, and the clock at its last command's answer.
+const tiles = new Map();
+for (const el of document.querySelectorAll('.tile')) {
+	const t = {el, error: el.querySelector('.error'), recording: false, refusal: '', fault: '', busy: false, answered: 0};
+	tiles.set(el.dataset.camera, t);
+	el.onclick = () => command('/' + encodeURIComponent(el.dataset.camera) + (t.recording ? '/stop' : '/start'), [t]);
+}
+const all = [...tiles.values()];
+start.onclick = () => command('/start', all);
+stop.onclick = () => command('/stop', all);
+
+// clock orders status requests and command answers.
+let clock = 0;
+
+// draw shows every tile's state. A status is unread when its camera's read
+// failed or the console didn't answer.
+function draw() {
+	const unanswered = fault.textContent !== '';
+	for (const t of all) {
+		t.el.classList.toggle('recording', t.recording);
+		t.el.classList.toggle('stale', unanswered || t.fault !== '');
+		t.el.classList.toggle('busy', t.busy);
+		t.error.textContent = [t.refusal, t.fault].filter(Boolean).join('\n');
+	}
+	start.disabled = stop.disabled = all.some(t => t.busy);
+}
+
+// read takes a camera's line of a report into its tile.
+function read(t, s) {
+	if ('recording' in s) {
+		t.recording = s.recording;
+		t.fault = '';
+	} else {
+		t.fault = s.error;
+	}
+}
+
+// ask requests path and answers with its report's cameras.
+async function ask(method, path) {
+	const r = await fetch(path, {method});
+	if (!r.ok) throw new Error(method + ' ' + path + ': ' + r.status);
+	return (await r.json()).cameras;
+}
+
+// command sends the record command at path for the tiles ts, unless one of
+// them has a command outstanding, and shows its report.
+async function command(path, ts) {
+	if (ts.some(t => t.busy)) return;
+	for (const t of ts) t.busy = true;
+	draw();
+	try {
+		const cameras = await ask('POST', path);
+		clock++;
+		for (const s of cameras) {
+			const t = tiles.get(s.name);
+			t.answered = clock;
+			t.refusal = 'recording' in s && s.error || '';
+			read(t, s);
+		}
+		fault.textContent = '';
+	} catch (e) {
+		fault.textContent = 'console: ' + e.message;
+	}
+	for (const t of ts) t.busy = false;
+	draw();
+}
+
+// watch reads every camera's status, and again 3 s after each answer. A
+// tile whose command answered after the read was requested keeps the
+// command's report.
+async function watch() {
+	const asked = ++clock;
+	try {
+		for (const s of await ask('GET', '/status')) {
+			const t = tiles.get(s.name);
+			if (asked > t.answered) read(t, s);
+		}
+		fault.textContent = '';
+	} catch (e) {
+		fault.textContent = 'console: ' + e.message;
+	}
+	draw();
+	setTimeout(watch, 3000);
+}
+watch();
+</script>

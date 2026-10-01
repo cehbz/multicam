@@ -147,27 +147,26 @@ func TestRunServesSonyAndPixelCamerasUntilStopped(t *testing.T) {
 	}
 	page := body(http.Get(base + "/"))
 	last := -1
-	for _, want := range []string{`<img src="/one/liveview"`, `<iframe src="/one/record"`, `<img src="/pixel9/liveview"`, `<iframe src="/pixel9/record"`} {
+	for _, want := range []string{`data-camera="one"`, `<img src="/one/liveview"`, `data-camera="pixel9"`, `<img src="/pixel9/liveview"`} {
 		i := strings.Index(page, want)
 		if i <= last {
 			t.Errorf("page lacks %s after byte %d: %q", want, last, page)
 		}
 		last = max(last, i)
 	}
-	for _, path := range []string{"/one/record", "/pixel9/record"} {
-		if control := body(http.Get(base + path)); !strings.Contains(control, "<button>Start</button>") {
-			t.Fatalf("%s: %q, want a Start button", path, control)
-		}
+	if got, want := body(http.Get(base+"/status")), `{"cameras":[{"name":"one","recording":false},{"name":"pixel9","recording":false}]}`+"\n"; got != want {
+		t.Fatalf("status report %q, want %q", got, want)
 	}
 
-	// Start on the Pixel: the browser is redirected to its control.
-	if control := body(http.Post(base+"/pixel9/record/start", "", nil)); !strings.Contains(control, "recording <button>Stop</button>") {
-		t.Errorf("Pixel's control after Start: %q, want recording with a Stop button", control)
+	// Start on the Pixel alone.
+	if got, want := body(http.Post(base+"/pixel9/start", "", nil)), `{"cameras":[{"name":"pixel9","recording":true}]}`+"\n"; got != want {
+		t.Errorf("report of the Pixel's start %q, want %q", got, want)
 	}
 	wantPixel := []string{
-		pixelStatus,                                        // its control drawn
-		pixelStatus, pixelFront, pixelShutter, pixelStatus, // Start
-		pixelStatus, // its control redrawn
+		pixelStatus,                                        // the status report
+		pixelStatus,                                        // Start: its status before,
+		pixelStatus, pixelFront, pixelShutter, pixelStatus, // the command,
+		pixelStatus, // and its status after
 	}
 	if got := pixelCommands(); !slices.Equal(got, wantPixel) {
 		t.Errorf("adb commands to the Pixel:\n got %q\nwant %q", got, wantPixel)
