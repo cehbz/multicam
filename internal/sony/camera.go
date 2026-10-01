@@ -4,20 +4,47 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"runtime"
+	"syscall"
+	"time"
 )
 
 // DefaultEndpoint is the camera service URL of the RX10M4 and RX100M6.
 const DefaultEndpoint = "http://192.168.122.1:10000/sony/camera"
 
-// Camera is one body, reached at its camera service endpoint.
+// Camera is one body, reached at its camera service endpoint. Its connections
+// are its own, since both bodies answer at the same address.
 type Camera struct {
-	rpc *Client
+	rpc    *Client
+	stream *http.Client // liveview streams: no time limit
 }
 
-// NewCamera returns the camera whose camera service is at endpoint.
-func NewCamera(endpoint string) *Camera {
-	return &Camera{rpc: NewClient(endpoint)}
+// NewCamera returns the camera whose camera service is at endpoint, with its
+// connections bound to the network interface iface. An empty iface leaves the
+// route to the system; a named one needs Linux.
+func NewCamera(endpoint, iface string) (*Camera, error) {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	if iface != "" {
+		if bindToDevice == nil {
+			return nil, fmt.Errorf("camera on interface %s: binding to an interface is not supported on %s", iface, runtime.GOOS)
+		}
+		dialer.Control = func(_, _ string, c syscall.RawConn) error {
+			var err error
+			if cerr := c.Control(func(fd uintptr) { err = bindToDevice(int(fd), iface) }); cerr != nil {
+				return cerr
+			}
+			if err != nil {
+				return fmt.Errorf("bind to interface %s: %w", iface, err)
+			}
+			return nil
+		}
+	}
+	transport := &http.Transport{DialContext: dialer.DialContext}
+	rpc := NewClient(endpoint)
+	rpc.HTTP.Transport = transport
+	return &Camera{rpc: rpc, stream: &http.Client{Transport: transport}}, nil
 }
 
 // StartRecording starts movie recording. A refusal is the camera's *Error.
@@ -90,7 +117,7 @@ func (l *Liveview) open(start *Response) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := l.cam.stream.Do(req)
 	if err != nil {
 		return err
 	}

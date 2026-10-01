@@ -1,0 +1,10 @@
+# The rig on the Pixel 3 XL: each camera joined on its own Wi-Fi interface.
+# endpoint is optional and defaults to the Sony bodies' fixed camera service.
+
+[[camera]]
+name = "rx10m4"
+interface = "wlan1"
+
+[[camera]]
+name = "rx100m6"
+interface = "cam2"

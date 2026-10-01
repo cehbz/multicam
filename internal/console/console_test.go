@@ -22,7 +22,11 @@ import (
 // newConsole returns a fake camera and the console for it.
 func newConsole(t *testing.T) (*sonytest.Camera, http.Handler) {
 	fake := sonytest.NewCamera(t)
-	return fake, New(sony.NewCamera(fake.Endpoint()))
+	cam, err := sony.NewCamera(fake.Endpoint(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fake, New(cam)
 }
 
 var imgSrc = regexp.MustCompile(`<img src="([^"]+)"`)

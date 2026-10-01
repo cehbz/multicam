@@ -5,15 +5,28 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
+
+// newCamera returns the camera at fake, not bound to an interface.
+func newCamera(t *testing.T, fake *sonytest.Camera) *Camera {
+	t.Helper()
+	cam, err := NewCamera(fake.Endpoint(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cam
+}
 
 func TestDefaultEndpoint(t *testing.T) {
 	if want := "http://192.168.122.1:10000/sony/camera"; DefaultEndpoint != want {
@@ -23,7 +36,7 @@ func TestDefaultEndpoint(t *testing.T) {
 
 func TestLiveviewYieldsJPEGFramesInOrder(t *testing.T) {
 	fake := sonytest.NewCamera(t)
-	lv, err := NewCamera(fake.Endpoint()).Liveview(t.Context())
+	lv, err := newCamera(t, fake).Liveview(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +57,7 @@ func TestLiveviewYieldsJPEGFramesInOrder(t *testing.T) {
 
 func TestLiveviewCloseStopsLiveview(t *testing.T) {
 	fake := sonytest.NewCamera(t)
-	lv, err := NewCamera(fake.Endpoint()).Liveview(t.Context())
+	lv, err := newCamera(t, fake).Liveview(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +79,7 @@ func TestLiveviewCancelEndsStream(t *testing.T) {
 	fake := sonytest.NewCamera(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	lv, err := NewCamera(fake.Endpoint()).Liveview(ctx)
+	lv, err := newCamera(t, fake).Liveview(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +104,7 @@ func TestLiveviewCancelEndsStream(t *testing.T) {
 func TestLiveviewStartError(t *testing.T) {
 	fake := sonytest.NewCamera(t)
 	fake.Fail("startLiveview", 40401, "Camera Not Ready")
-	lv, err := NewCamera(fake.Endpoint()).Liveview(t.Context())
+	lv, err := newCamera(t, fake).Liveview(t.Context())
 	var camErr *Error
 	if !errors.As(err, &camErr) || camErr.Code != 40401 {
 		t.Errorf("err = %v, want camera error 40401", err)
@@ -123,7 +136,11 @@ func TestLiveviewStreamOpenFailureStopsLiveview(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	lv, err := NewCamera(srv.URL).Liveview(t.Context())
+	cam, err := NewCamera(srv.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lv, err := cam.Liveview(t.Context())
 	if err == nil || lv != nil {
 		t.Errorf("Liveview = %v, %v; want an error and no session", lv, err)
 	}
@@ -136,7 +153,7 @@ func TestLiveviewStreamOpenFailureStopsLiveview(t *testing.T) {
 
 func TestRecordingFollowsStartAndStop(t *testing.T) {
 	fake := sonytest.NewCamera(t)
-	cam := NewCamera(fake.Endpoint())
+	cam := newCamera(t, fake)
 	recording := func(when string, want bool) {
 		t.Helper()
 		got, err := cam.Recording(t.Context())
@@ -175,7 +192,7 @@ func TestRecordingRefusalIsTheCameraError(t *testing.T) {
 		t.Run(tt.method, func(t *testing.T) {
 			fake := sonytest.NewCamera(t)
 			fake.Fail(tt.method, 40401, "Camera Not Ready")
-			err := tt.call(NewCamera(fake.Endpoint()), t.Context())
+			err := tt.call(newCamera(t, fake), t.Context())
 			var camErr *Error
 			if !errors.As(err, &camErr) || camErr.Code != 40401 {
 				t.Errorf("err = %v, want camera error 40401", err)
@@ -201,7 +218,7 @@ func TestRecordingByCameraStatus(t *testing.T) {
 		{"StillCapturing", false},
 	}
 	fake := sonytest.NewCamera(t)
-	cam := NewCamera(fake.Endpoint())
+	cam := newCamera(t, fake)
 	for _, tt := range tests {
 		fake.SetCameraStatus(tt.status)
 		got, err := cam.Recording(t.Context())
@@ -211,5 +228,113 @@ func TestRecordingByCameraStatus(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("cameraStatus %s: Recording = %v, want %v", tt.status, got, tt.want)
 		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Both Sony bodies answer at the same address, so a camera's calls and its
+// liveview stream stay off the transport other HTTP clients share.
+func TestCameraConnectionsAreItsOwn(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	cam := newCamera(t, fake)
+	defer func(rt http.RoundTripper) { http.DefaultTransport = rt }(http.DefaultTransport)
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("%s %s went through the shared default transport", r.Method, r.URL.Path)
+	})
+
+	lv, err := cam.Liveview(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lv.Next(); err != nil {
+		t.Errorf("first frame: %v", err)
+	}
+	if err := lv.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+// recordBinds replaces the system's bind with one that records the interface
+// of each connection it is asked to bind and answers with err.
+func recordBinds(t *testing.T, err error) func() []string {
+	var mu sync.Mutex
+	var ifaces []string
+	system := bindToDevice
+	t.Cleanup(func() { bindToDevice = system })
+	bindToDevice = func(fd int, iface string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		ifaces = append(ifaces, iface)
+		return err
+	}
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(ifaces)
+	}
+}
+
+func TestCameraBindsItsConnectionsToItsInterface(t *testing.T) {
+	// One address for both cameras, as on the rig.
+	fake := sonytest.NewCamera(t)
+	binds := recordBinds(t, nil)
+	first, err := NewCamera(fake.Endpoint(), "wlan1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewCamera(fake.Endpoint(), "cam2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lv, err := first.Liveview(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lv.Next(); err != nil {
+		t.Errorf("first frame: %v", err)
+	}
+	if err := lv.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if got := binds(); len(got) == 0 || slices.ContainsFunc(got, func(iface string) bool { return iface != "wlan1" }) {
+		t.Errorf("first camera's connections bound to %v, want each to wlan1", got)
+	}
+
+	// The second camera does not reuse the first's idle connection.
+	if _, err := second.Recording(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := binds(); !slices.Contains(got, "cam2") {
+		t.Errorf("connections bound to %v, want the second camera's bound to cam2", got)
+	}
+}
+
+func TestCameraBindFailureNamesTheInterface(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	recordBinds(t, errors.New("no such device"))
+	cam, err := NewCamera(fake.Endpoint(), "cam2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cam.Recording(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "cam2") || !strings.Contains(err.Error(), "no such device") {
+		t.Errorf("err = %v, want the bind failure on cam2", err)
+	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("camera reached over an unbound connection: %v", calls)
+	}
+}
+
+func TestCameraOnAnInterfaceNeedsLinux(t *testing.T) {
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		t.Skip("this system binds connections to interfaces")
+	}
+	cam, err := NewCamera(DefaultEndpoint, "wlan1")
+	if err == nil || cam != nil || !strings.Contains(err.Error(), "wlan1") || !strings.Contains(err.Error(), runtime.GOOS) {
+		t.Errorf("NewCamera = %v, %v; want an error naming wlan1 and %s", cam, err, runtime.GOOS)
 	}
 }

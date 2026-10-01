@@ -3,21 +3,52 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cehbz/multicam/internal/rig"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
 
+func TestConfigPath(t *testing.T) {
+	tests := []struct {
+		args    []string
+		want    string
+		wantErr bool
+	}{
+		{nil, "multicam.toml", false},
+		{[]string{"/data/local/tmp/rig.toml"}, "/data/local/tmp/rig.toml", false},
+		{[]string{"a.toml", "b.toml"}, "", true},
+	}
+	for _, tt := range tests {
+		got, err := configPath(tt.args)
+		if got != tt.want || (err != nil) != tt.wantErr {
+			t.Errorf("configPath(%q) = %q, %v; want %q, error %v", tt.args, got, err, tt.want, tt.wantErr)
+		}
+	}
+}
+
 func TestRunServesTheConsoleUntilStopped(t *testing.T) {
-	fake := sonytest.NewCamera(t)
+	fake, other := sonytest.NewCamera(t), sonytest.NewCamera(t)
+	config := filepath.Join(t.TempDir(), "multicam.toml")
+	text := fmt.Sprintf("[[camera]]\nname = \"one\"\nendpoint = %q\n[[camera]]\nname = \"two\"\nendpoint = %q\n", fake.Endpoint(), other.Endpoint())
+	if err := os.WriteFile(config, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := rig.Load(config)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -25,7 +56,7 @@ func TestRunServesTheConsoleUntilStopped(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, ln, fake.Endpoint()) }()
+	go func() { done <- run(ctx, ln, r) }()
 	base := "http://" + ln.Addr().String()
 
 	get := func(path string) (*http.Response, string) {
@@ -75,5 +106,8 @@ func TestRunServesTheConsoleUntilStopped(t *testing.T) {
 	}
 	if got, want := fake.Calls(), []string{"getEvent@1.3", "startLiveview@1.0", "stopLiveview@1.0"}; !slices.Equal(got, want) {
 		t.Errorf("camera calls %v, want %v", got, want)
+	}
+	if got := other.Calls(); len(got) != 0 {
+		t.Errorf("the rig's second camera was called: %v", got)
 	}
 }
