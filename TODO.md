@@ -9,10 +9,15 @@ Design and findings: KB node `projects/multicam.md`.
    reloaded. Open: whether "in use" means the server running or the page
    being viewed.
 
-Regroup after these. Candidates: clip-end auto-restart from `getEvent`
-recording status; exposure, focus and zoom controls (probe both bodies in
-Manual mode first for `setShutterSpeed`, `setFNumber`, `setFocusMode`);
-multi-hour power (dummy batteries in the cameras, the phone on a charger).
+Regroup after these. Candidates:
+- Clip-end auto-restart from `getEvent` recording status.
+- A parked format and a recording format per camera, switched at Start and
+  back at Stop, so the RX100M6 idles in 1080p and can still take short 4K
+  clips.
+- The camera's overheating flag shown on the console.
+- Exposure, focus and zoom controls (probe both bodies in Manual mode first
+  for `setShutterSpeed`, `setFNumber`, `setFocusMode`).
+- Multi-hour power (dummy batteries in the cameras, the phone on a charger).
 
 ## Nice to have
 - Mac console over the home LAN.
