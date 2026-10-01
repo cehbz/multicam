@@ -19,3 +19,5 @@ a charger plug-cycle).
 
 ## Nice to have
 - Mac console over the home LAN.
+- Both cameras on one 2.4 GHz channel, so their liveview isn't time-sliced:
+  find out whether the Sony bodies can be made to use a set Wi-Fi channel.
