@@ -37,7 +37,7 @@ func main() {
 // closed.
 func run(ctx context.Context, ln net.Listener, endpoint string) error {
 	srv := &http.Server{
-		Handler:     console.New(sony.NewCamera(endpoint).Liveview),
+		Handler:     console.New(sony.NewCamera(endpoint)),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	stopped := make(chan error, 1)
