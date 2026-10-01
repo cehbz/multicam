@@ -9,16 +9,44 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
-
-	"github.com/cehbz/multicam/internal/sony"
 )
+
+// Liveview is a running stream of JPEG frames: Next yields the next frame,
+// Close ends the stream.
+type Liveview interface {
+	Next() ([]byte, error)
+	Close() error
+}
 
 // Camera is what the console needs of a camera.
 type Camera interface {
-	Liveview(ctx context.Context) (*sony.Liveview, error)
+	Liveview(ctx context.Context) (Liveview, error)
 	StartRecording(ctx context.Context) error
 	StopRecording(ctx context.Context) error
 	Recording(ctx context.Context) (bool, error)
+}
+
+// Source is a camera as its own package defines it, with liveview sessions of
+// its own type L.
+type Source[L Liveview] interface {
+	Liveview(ctx context.Context) (L, error)
+	StartRecording(ctx context.Context) error
+	StopRecording(ctx context.Context) error
+	Recording(ctx context.Context) (bool, error)
+}
+
+// Adapt returns src as a Camera.
+func Adapt[L Liveview](src Source[L]) Camera { return adapted[L]{src} }
+
+type adapted[L Liveview] struct{ Source[L] }
+
+// Liveview starts the source's liveview. A failed start has no session.
+func (a adapted[L]) Liveview(ctx context.Context) (Liveview, error) {
+	lv, err := a.Source.Liveview(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return lv, nil
 }
 
 // Named is a camera under the name the console shows it by and keys its
@@ -130,7 +158,7 @@ func New(cameras []Named) http.Handler {
 
 // relay writes each JPEG frame of lv as one part of a multipart/x-mixed-replace
 // response, flushed per frame, until lv or the viewer ends.
-func relay(w http.ResponseWriter, lv *sony.Liveview) {
+func relay(w http.ResponseWriter, lv Liveview) {
 	parts := multipart.NewWriter(w)
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+parts.Boundary())
 	flusher := http.NewResponseController(w)

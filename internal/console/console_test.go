@@ -3,6 +3,7 @@ package console
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"mime"
@@ -26,7 +27,7 @@ func named(t *testing.T, name, endpoint string) Named {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return Named{Name: name, Camera: cam}
+	return Named{Name: name, Camera: Adapt(cam)}
 }
 
 // newConsole returns a fake camera and the console for it alone.
@@ -514,5 +515,78 @@ func TestUnreachableCameraLeavesTheOtherWorking(t *testing.T) {
 	}
 	if got, _ := io.ReadAll(p); !bytes.Equal(got, front.Frames[0]) {
 		t.Errorf("front picture's first part is not its camera's first frame")
+	}
+}
+
+// stills is a camera that is not a Sony body: each liveview session yields its
+// frames once and then ends.
+type stills struct {
+	frames   [][]byte
+	startErr error
+	closed   int
+}
+
+type stillsSession struct {
+	cam  *stills
+	next int
+}
+
+func (c *stills) Liveview(context.Context) (*stillsSession, error) {
+	if c.startErr != nil {
+		return nil, c.startErr
+	}
+	return &stillsSession{cam: c}, nil
+}
+
+func (c *stills) StartRecording(context.Context) error    { return nil }
+func (c *stills) StopRecording(context.Context) error     { return nil }
+func (c *stills) Recording(context.Context) (bool, error) { return false, nil }
+
+func (s *stillsSession) Next() ([]byte, error) {
+	if s.next == len(s.cam.frames) {
+		return nil, io.EOF
+	}
+	s.next++
+	return s.cam.frames[s.next-1], nil
+}
+
+func (s *stillsSession) Close() error {
+	s.cam.closed++
+	return nil
+}
+
+func TestRelaysAnyCamerasLiveview(t *testing.T) {
+	cam := &stills{frames: [][]byte{[]byte("screen 1"), []byte("screen 2"), []byte("screen 3")}}
+	console := New([]Named{{Name: "phone", Camera: Adapt(cam)}})
+
+	rec := get(console, "/phone/liveview")
+	mediaType, params, err := mime.ParseMediaType(rec.Header().Get("Content-Type"))
+	if rec.Code != http.StatusOK || err != nil || mediaType != "multipart/x-mixed-replace" {
+		t.Fatalf("status %d, Content-Type %q; want 200 multipart/x-mixed-replace", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	parts := multipart.NewReader(rec.Body, params["boundary"])
+	for i, want := range cam.frames {
+		p, err := parts.NextPart()
+		if err != nil {
+			t.Fatalf("part %d: %v", i, err)
+		}
+		if got, _ := io.ReadAll(p); !bytes.Equal(got, want) || p.Header.Get("Content-Type") != "image/jpeg" {
+			t.Errorf("part %d = %q as %q, want %q as image/jpeg", i, got, p.Header.Get("Content-Type"), want)
+		}
+	}
+	if cam.closed != 1 {
+		t.Errorf("liveview session closed %d times, want once", cam.closed)
+	}
+}
+
+func TestAdaptedFailedStartHasNoSession(t *testing.T) {
+	cam := &stills{startErr: errors.New("screen off")}
+	lv, err := Adapt(cam).Liveview(t.Context())
+	if err == nil || lv != nil {
+		t.Errorf("Liveview = %#v, %v; want no session and the error", lv, err)
+	}
+	console := New([]Named{{Name: "phone", Camera: Adapt(cam)}})
+	if rec := get(console, "/phone/liveview"); rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "screen off") {
+		t.Errorf("picture: status %d %q, want %d with the error", rec.Code, rec.Body, http.StatusBadGateway)
 	}
 }

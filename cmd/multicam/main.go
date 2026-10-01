@@ -65,7 +65,7 @@ func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
 	var cameras []console.Named
 	var names []string
 	for _, c := range r.Cameras {
-		cameras = append(cameras, console.Named{Name: c.Name, Camera: c.Camera})
+		cameras = append(cameras, console.Named{Name: c.Name, Camera: console.Adapt(c.Camera)})
 		names = append(names, c.Name)
 	}
 	srv := &http.Server{
