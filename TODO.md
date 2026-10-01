@@ -16,6 +16,8 @@ multi-hour power (dummy batteries in the cameras, the phone on a charger).
 
 ## Nice to have
 - Mac console over the home LAN.
+- Two viewers of one camera at once, such as the phone and the Mac: today a
+  Sony body's second viewer is refused and stops the first viewer's picture.
 - Both cameras on one 2.4 GHz channel, so their liveview isn't time-sliced:
   find out whether the Sony bodies can be made to use a set Wi-Fi channel.
   Measured with both connected: 24.8 and 24.7 fps when both were on
