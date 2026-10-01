@@ -33,6 +33,7 @@ type Camera struct {
 	zoom       int
 	calls      []string
 	failures   map[string][]any
+	status     string
 }
 
 // NewCamera starts a fake camera that is shut down when the test ends.
@@ -72,6 +73,13 @@ func (c *Camera) Fail(method string, code int, message string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.failures[method] = []any{code, message}
+}
+
+// SetCameraStatus makes getEvent report status as the cameraStatus.
+func (c *Camera) SetCameraStatus(status string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status = status
 }
 
 func (c *Camera) apis() []string {
@@ -137,6 +145,9 @@ func (c *Camera) rpc(w http.ResponseWriter, r *http.Request) {
 			status = "NotReady"
 		case c.recording:
 			status = "MovieRecording"
+		}
+		if c.status != "" {
+			status = c.status
 		}
 		reply("result", []any{
 			map[string]any{"type": "availableApiList", "names": c.apis()},

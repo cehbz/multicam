@@ -133,3 +133,83 @@ func TestLiveviewStreamOpenFailureStopsLiveview(t *testing.T) {
 		t.Errorf("camera calls %v, want %v", calls, want)
 	}
 }
+
+func TestRecordingFollowsStartAndStop(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	cam := NewCamera(fake.Endpoint())
+	recording := func(when string, want bool) {
+		t.Helper()
+		got, err := cam.Recording(t.Context())
+		if err != nil {
+			t.Fatalf("%s: Recording: %v", when, err)
+		}
+		if got != want {
+			t.Errorf("%s: Recording = %v, want %v", when, got, want)
+		}
+	}
+	recording("before start", false)
+	if err := cam.StartRecording(t.Context()); err != nil {
+		t.Fatalf("StartRecording: %v", err)
+	}
+	recording("after start", true)
+	if err := cam.StopRecording(t.Context()); err != nil {
+		t.Fatalf("StopRecording: %v", err)
+	}
+	recording("after stop", false)
+	want := []string{"getEvent@1.3", "startMovieRec@1.0", "getEvent@1.3", "stopMovieRec@1.0", "getEvent@1.3"}
+	if got := fake.Calls(); !slices.Equal(got, want) {
+		t.Errorf("camera calls %v, want %v", got, want)
+	}
+}
+
+func TestRecordingRefusalIsTheCameraError(t *testing.T) {
+	tests := []struct {
+		method string
+		call   func(*Camera, context.Context) error
+	}{
+		{"startMovieRec", (*Camera).StartRecording},
+		{"stopMovieRec", (*Camera).StopRecording},
+		{"getEvent", func(c *Camera, ctx context.Context) error { _, err := c.Recording(ctx); return err }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			fake := sonytest.NewCamera(t)
+			fake.Fail(tt.method, 40401, "Camera Not Ready")
+			err := tt.call(NewCamera(fake.Endpoint()), t.Context())
+			var camErr *Error
+			if !errors.As(err, &camErr) || camErr.Code != 40401 {
+				t.Errorf("err = %v, want camera error 40401", err)
+			}
+		})
+	}
+}
+
+// Statuses per Sony's sample client; the RX10M4 and RX100M6 captures show only
+// IDLE and MovieRecording around startMovieRec and stopMovieRec.
+func TestRecordingByCameraStatus(t *testing.T) {
+	tests := []struct {
+		status string
+		want   bool
+	}{
+		{"IDLE", false},
+		{"MovieWaitRecStart", true},
+		{"MovieRecording", true},
+		{"MovieWaitRecStop", false},
+		{"MovieSaving", false},
+		{"NotReady", false},
+		{"Error", false},
+		{"StillCapturing", false},
+	}
+	fake := sonytest.NewCamera(t)
+	cam := NewCamera(fake.Endpoint())
+	for _, tt := range tests {
+		fake.SetCameraStatus(tt.status)
+		got, err := cam.Recording(t.Context())
+		if err != nil {
+			t.Fatalf("%s: %v", tt.status, err)
+		}
+		if got != tt.want {
+			t.Errorf("cameraStatus %s: Recording = %v, want %v", tt.status, got, tt.want)
+		}
+	}
+}

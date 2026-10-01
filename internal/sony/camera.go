@@ -20,6 +20,39 @@ func NewCamera(endpoint string) *Camera {
 	return &Camera{rpc: NewClient(endpoint)}
 }
 
+// StartRecording starts movie recording. A refusal is the camera's *Error.
+func (c *Camera) StartRecording(ctx context.Context) error {
+	return c.call(ctx, "startMovieRec")
+}
+
+// StopRecording stops movie recording. A refusal is the camera's *Error.
+func (c *Camera) StopRecording(ctx context.Context) error {
+	return c.call(ctx, "stopMovieRec")
+}
+
+func (c *Camera) call(ctx context.Context, method string) error {
+	if _, err := c.rpc.Call(ctx, method, "1.0"); err != nil {
+		return fmt.Errorf("%s: %w", method, err)
+	}
+	return nil
+}
+
+// Recording reports whether the camera is recording a movie, from one
+// getEvent without long polling: cameraStatus MovieRecording, or
+// MovieWaitRecStart, which leads to it. MovieWaitRecStop and MovieSaving,
+// which follow a stop, are not recording.
+func (c *Camera) Recording(ctx context.Context) (bool, error) {
+	ex, err := c.rpc.Call(ctx, "getEvent", "1.3", false)
+	if err != nil {
+		return false, fmt.Errorf("getEvent: %w", err)
+	}
+	ev, err := ex.Decoded.Event()
+	if err != nil {
+		return false, err
+	}
+	return ev.CameraStatus == "MovieRecording" || ev.CameraStatus == "MovieWaitRecStart", nil
+}
+
 // Liveview is a running liveview session: the camera's stream of JPEG frames,
 // from Camera.Liveview until Close.
 type Liveview struct {
