@@ -2,30 +2,23 @@
 
 Design and findings: KB node `projects/multicam.md`.
 
-## Verifications
+## Stories, in order
+1. Liveview of one Sony camera in a browser, served by the Go server on
+   the Pixel 3 XL.
+2. Record start/stop for that camera.
+3. Second Sony camera, which needs the flash and a dongle:
+   - Flash: stock Android 12, Magisk, Alynx v4 crosshatch build,
+     `Wireless_firmware.zip` module.
+   - Dongle: interface up, sustained STA association to a camera AP,
+     throughput at or above the liveview rate.
+4. Clip-end auto-restart from `getEvent` recording status.
+5. Pixel 9 over wireless ADB on the home Wi-Fi, with the Pixel 3 XL on home
+   Wi-Fi as a second STA on its internal radio: view and record.
 
-Pixel 3 XL flash: stock Android 12, Magisk, Alynx v4 crosshatch build,
-`Wireless_firmware.zip` module.
+Regroup after these. Candidates: exposure, focus and zoom controls (probe
+both bodies in Manual mode first for `setShutterSpeed`, `setFNumber`,
+`setFocusMode`); multi-hour power (hub charge+host test per hub, including
+a charger plug-cycle).
 
-After flash:
-1. `zcat /proc/config.gz`: record the shipped driver set (settles
-   MT7601U).
-2. Camera STA (2.4 GHz) plus 5 GHz hotspot still run together on the
-   Alynx kernel.
-3. Routing: hub-AP client reaches a camera subnet via iptables.
-4. Dongle on the phone: interface up, sustained STA association to a
-   camera AP, throughput at or above the liveview rate.
-5. Hub charge+host test per hub, including a charger plug-cycle.
-
-Pixel 9 leg:
-6. Wireless-ADB re-attach script (`adb mdns services`); scrcpy from the
-   Mac; ws-scrcpy fork against Android 16 only if dashboard embedding is
-   wanted.
-
-## Build
-- SSDP discovery sends on the camera's interface.
-- Go core: Sony API client, liveview parser, record-all orchestration with
-  clip-end auto-restart, ADB supervision, browser UI.
-- Exposure and focus controls: probe both bodies in Manual mode first to
-  see whether `setShutterSpeed`, `setFNumber` and `setFocusMode` become
-  available.
+## Nice to have
+- Mac console over the home LAN.
