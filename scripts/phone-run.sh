@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Cross-build multicam, push it to the phone over adb and run it there in the
-# foreground, with the console port forwarded to this Mac. Ctrl-C stops it.
+# Cross-build multicam, push it and the rig's config to the phone over adb and
+# run it there as root in the foreground, with the console port forwarded to
+# this Mac. Ctrl-C stops it. The camera links come from scripts/phone-links.sh.
 # Usage: scripts/phone-run.sh
 set -uo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 bin=$repo/bin/multicam-android
 remote=/data/local/tmp/multicam
+config=/data/local/tmp/mc/multicam.toml
 port=8080
 
 (cd "$repo" && CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o "$bin" ./cmd/multicam) || exit 1
@@ -14,9 +16,9 @@ adb get-state >/dev/null || exit 1
 
 # SIGTERM, up to 5 s for a clean exit, then SIGKILL; fails if it survives.
 stop_remote() {
-	adb shell 'pkill -x multicam
+	adb shell "su -c 'pkill -x multicam
 		for i in 1 2 3 4 5; do pidof multicam >/dev/null || exit 0; sleep 1; done
-		pkill -9 -x multicam; sleep 1; ! pidof multicam >/dev/null'
+		pkill -9 -x multicam; sleep 1; ! pidof multicam >/dev/null'"
 }
 
 cleaned=0
@@ -27,7 +29,7 @@ cleanup() {
 		echo "multicam is not running on the phone"
 	else
 		echo "warning: multicam is still running on the phone" >&2
-		echo "  run: adb shell pkill -9 -x multicam" >&2
+		echo "  run: adb shell su -c 'pkill -9 -x multicam'" >&2
 	fi
 	adb forward --remove "tcp:$port" >/dev/null 2>&1
 }
@@ -39,11 +41,13 @@ if ! stop_remote; then
 	exit 1
 fi
 adb push "$bin" "$remote" || exit 1
+adb shell "mkdir -p $(dirname "$config")" || exit 1
+adb push "$repo/multicam.phone.toml" "$config" >/dev/null || exit 1
 adb forward "tcp:$port" "tcp:$port" >/dev/null || exit 1
 echo "Console at http://localhost:$port/ (Ctrl-C stops multicam on the phone)"
 
 # -t gives the phone side a terminal, so Ctrl-C reaches multicam as SIGINT.
-adb shell -t "$remote"
+adb shell -t "su -c '$remote $config'"
 rc=$?
 echo "multicam exited $rc"
 exit $rc
