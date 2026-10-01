@@ -62,14 +62,12 @@ func configPath(args []string) (string, error) {
 // Requests end with ctx, and run returns once their liveview sessions have
 // closed.
 func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
-	var cameras []console.Named
 	var names []string
 	for _, c := range r.Cameras {
-		cameras = append(cameras, console.Named{Name: c.Name, Camera: console.Adapt(c.Camera)})
 		names = append(names, c.Name)
 	}
 	srv := &http.Server{
-		Handler:     console.New(cameras),
+		Handler:     console.New(r.Cameras),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	stopped := make(chan error, 1)

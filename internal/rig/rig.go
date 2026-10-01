@@ -5,32 +5,23 @@ package rig
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"net"
 	"os"
 	"regexp"
+	"slices"
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/cehbz/multicam/internal/console"
+	"github.com/cehbz/multicam/internal/pixel"
 	"github.com/cehbz/multicam/internal/sony"
 )
 
-// Camera is one of the rig's cameras.
-type Camera struct {
-	Name string
-	*sony.Camera
-}
-
-// Rig is the cameras the server knows, in config order.
+// Rig is the cameras the server knows, in config order, each under its name
+// and ready for the console.
 type Rig struct {
-	Cameras []Camera
-}
-
-// cameraConfig is one [[camera]] table of the config file: the camera's name,
-// the network interface it is reached on (empty: the system's route) and its
-// camera service endpoint (sony.DefaultEndpoint when left out).
-type cameraConfig struct {
-	Name      string `toml:"name"`
-	Interface string `toml:"interface"`
-	Endpoint  string `toml:"endpoint"`
+	Cameras []console.Named
 }
 
 // Load reads the rig from the TOML config file at path.
@@ -45,23 +36,88 @@ func Load(path string) (*Rig, error) {
 	}
 	rig := &Rig{}
 	for _, c := range cameras {
-		body, err := sony.NewCamera(c.Endpoint, c.Interface)
+		cam, err := c.Kind.open()
 		if err != nil {
 			return nil, fmt.Errorf("%s: camera %s: %w", path, c.Name, err)
 		}
-		rig.Cameras = append(rig.Cameras, Camera{Name: c.Name, Camera: body})
+		rig.Cameras = append(rig.Cameras, console.Named{Name: c.Name, Camera: cam})
 	}
 	return rig, nil
+}
+
+// camera is one [[camera]] table of the config file: its name and, by its
+// kind, how it is reached.
+type camera struct {
+	Name string
+	Kind kind
+}
+
+// kind is what a camera's table says beyond its name; open makes the camera.
+type kind interface {
+	open() (console.Camera, error)
+}
+
+// sonyBody is a Sony body (kind "sony"): the network interface it is reached
+// on (empty: the system's route) and its camera service endpoint
+// (sony.DefaultEndpoint when left out).
+type sonyBody struct {
+	Interface string
+	Endpoint  string
+}
+
+func (b sonyBody) open() (console.Camera, error) {
+	cam, err := sony.NewCamera(b.Endpoint, b.Interface)
+	if err != nil {
+		return nil, err
+	}
+	return console.Adapt(cam), nil
+}
+
+// pixelPhone is a Pixel (kind "pixel"): the address of its wireless
+// debugging, and the adb client that reaches it.
+type pixelPhone struct {
+	Address string
+	adb     adbClient
+}
+
+func (p pixelPhone) open() (console.Camera, error) {
+	return console.Adapt(pixel.NewCamera(pixel.ADB(p.adb.Path, p.adb.KeyDir, p.Address))), nil
+}
+
+// adbClient is the config's [adb] table: the adb binary and the directory it
+// keeps its key in.
+type adbClient struct {
+	Path   string `toml:"path"`
+	KeyDir string `toml:"key_dir"`
+}
+
+// settings is the keys of one [[camera]] table. take removes the ones read;
+// the ones left are unknown to the camera's kind.
+type settings struct {
+	keys map[string]any
+	err  error // the first value that was not a string
+}
+
+// take returns the string at key, empty when the table lacks it.
+func (s *settings) take(key string) string {
+	v, present := s.keys[key]
+	delete(s.keys, key)
+	str, isString := v.(string)
+	if present && !isString && s.err == nil {
+		s.err = fmt.Errorf("%s is not a string", key)
+	}
+	return str
 }
 
 // A camera's name is one URL path segment.
 var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 // parse decodes and validates a config: at least one camera, each with a
-// unique valid name.
-func parse(text string) ([]cameraConfig, error) {
+// unique valid name and the settings of its kind.
+func parse(text string) ([]camera, error) {
 	var config struct {
-		Cameras []cameraConfig `toml:"camera"`
+		ADB     adbClient        `toml:"adb"`
+		Cameras []map[string]any `toml:"camera"`
 	}
 	md, err := toml.Decode(text, &config)
 	if err != nil {
@@ -73,19 +129,51 @@ func parse(text string) ([]cameraConfig, error) {
 	if len(config.Cameras) == 0 {
 		return nil, errors.New("no cameras")
 	}
+	var cameras []camera
 	numbers := map[string]int{}
-	for i := range config.Cameras {
-		c := &config.Cameras[i]
-		if !validName.MatchString(c.Name) {
-			return nil, fmt.Errorf("camera %d: name %q is not letters, digits, - and _", i+1, c.Name)
+	for i, keys := range config.Cameras {
+		s := &settings{keys: keys}
+		name := s.take("name")
+		if !validName.MatchString(name) {
+			return nil, fmt.Errorf("camera %d: name %q is not letters, digits, - and _", i+1, name)
 		}
-		if first, dup := numbers[c.Name]; dup {
-			return nil, fmt.Errorf("camera %d: name %q is already camera %d", i+1, c.Name, first)
+		if first, dup := numbers[name]; dup {
+			return nil, fmt.Errorf("camera %d: name %q is already camera %d", i+1, name, first)
 		}
-		numbers[c.Name] = i + 1
-		if c.Endpoint == "" {
-			c.Endpoint = sony.DefaultEndpoint
+		numbers[name] = i + 1
+
+		c := camera{Name: name}
+		var kindErr error
+		switch kindName := s.take("kind"); kindName {
+		case "sony":
+			body := sonyBody{Interface: s.take("interface"), Endpoint: s.take("endpoint")}
+			if body.Endpoint == "" {
+				body.Endpoint = sony.DefaultEndpoint
+			}
+			c.Kind = body
+		case "pixel":
+			phone := pixelPhone{Address: s.take("address"), adb: config.ADB}
+			if _, _, err := net.SplitHostPort(phone.Address); err != nil {
+				kindErr = fmt.Errorf("address %q is not the phone's wireless debugging address and port", phone.Address)
+			} else if phone.adb.Path == "" || phone.adb.KeyDir == "" {
+				kindErr = errors.New("a Pixel needs [adb] path and key_dir")
+			}
+			c.Kind = phone
+		case "":
+			kindErr = errors.New(`no kind: add kind = "sony" or kind = "pixel"`)
+		default:
+			kindErr = fmt.Errorf(`kind %q is not "sony" or "pixel"`, kindName)
 		}
+		if kindErr == nil {
+			kindErr = s.err
+		}
+		if unknown := slices.Sorted(maps.Keys(s.keys)); kindErr == nil && len(unknown) > 0 {
+			kindErr = fmt.Errorf("unknown key %q", unknown[0])
+		}
+		if kindErr != nil {
+			return nil, fmt.Errorf("camera %d (%s): %w", i+1, name, kindErr)
+		}
+		cameras = append(cameras, c)
 	}
-	return config.Cameras, nil
+	return cameras, nil
 }
