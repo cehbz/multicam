@@ -24,7 +24,8 @@ type Rig struct {
 	Cameras []console.Named
 }
 
-// Load reads the rig from the TOML config file at path.
+// Load reads the rig from the TOML config file at path. A Pixel's picture is
+// shown on its side: its screenshots are portrait while it films on its side.
 func Load(path string) (*Rig, error) {
 	text, err := os.ReadFile(path)
 	if err != nil {
@@ -40,7 +41,8 @@ func Load(path string) (*Rig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: camera %s: %w", path, c.Name, err)
 		}
-		rig.Cameras = append(rig.Cameras, console.Named{Name: c.Name, Camera: cam})
+		_, phone := c.Kind.(pixelPhone)
+		rig.Cameras = append(rig.Cameras, console.Named{Name: c.Name, Camera: cam, OnItsSide: phone})
 	}
 	return rig, nil
 }

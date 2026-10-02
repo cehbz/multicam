@@ -287,6 +287,22 @@ func TestPageTilesEveryCameraInOrder(t *testing.T) {
 	}
 }
 
+// tile matches a tile's opening tag: what its class says after "tile", and
+// its camera.
+var tile = regexp.MustCompile(`<button class="tile([^"]*)" data-camera="([^"]+)">`)
+
+func TestPageMarksTheTilesShownOnTheirSide(t *testing.T) {
+	cam := Adapt(&stills{})
+	console := New([]Named{{Name: "level", Camera: cam}, {Name: "phone", Camera: cam, OnItsSide: true}})
+	var got []string
+	for _, m := range tile.FindAllStringSubmatch(get(console, "/").Body.String(), -1) {
+		got = append(got, m[2]+m[1])
+	}
+	if want := []string{"level", "phone on-its-side"}; !slices.Equal(got, want) {
+		t.Errorf("tiles %q, want %q", got, want)
+	}
+}
+
 func TestPageHasTheAllButtonsAndTheScript(t *testing.T) {
 	_, _, console := twoCameras(t)
 	page := get(console, "/").Body.String()
@@ -743,7 +759,7 @@ func TestCamerasAreAskedTogether(t *testing.T) {
 		asleep := &timed{takes: 15 * time.Second, err: errors.New("timed out")}
 		slow := &timed{takes: 2 * time.Second}
 		quick := &timed{}
-		console := New([]Named{{"asleep", asleep}, {"slow", slow}, {"quick", quick}})
+		console := New([]Named{{Name: "asleep", Camera: asleep}, {Name: "slow", Camera: slow}, {Name: "quick", Camera: quick}})
 
 		began := time.Now()
 		if got, want := summary(ask(t, console, http.MethodGet, "/status")), "asleep=?! slow=idle quick=idle"; got != want {

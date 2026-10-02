@@ -149,6 +149,23 @@ func TestLoadGivesEachCameraItsOwnBody(t *testing.T) {
 	}
 }
 
+func TestLoadShowsAPixelOnItsSide(t *testing.T) {
+	body := sonytest.NewCamera(t)
+	path := filepath.Join(t.TempDir(), "multicam.toml")
+	config := fmt.Sprintf("[adb]\npath = \"/usr/bin/adb\"\nkey_dir = \"/var/adbhome\"\n[[camera]]\nname = \"body\"\nkind = \"sony\"\nendpoint = %q\n[[camera]]\nname = \"phone\"\nkind = \"pixel\"\naddress = \"192.168.1.109:41419\"\n",
+		body.Endpoint())
+	if err := os.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rig, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rig.Cameras) != 2 || rig.Cameras[0].OnItsSide || !rig.Cameras[1].OnItsSide {
+		t.Errorf("rig cameras %v, want the Sony body upright and the Pixel on its side", rig.Cameras)
+	}
+}
+
 func TestLoadErrorsNameTheFile(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "multicam.toml")
 	if rig, err := Load(missing); err == nil || !strings.Contains(err.Error(), missing) {
