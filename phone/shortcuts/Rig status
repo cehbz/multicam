@@ -1,0 +1,7 @@
+#!/system/bin/sh
+# Termux:Widget shortcut: rig.sh status as root, with the output shown in a
+# Termux session. Lives in ~/.shortcuts of Termux's home, pushed there by
+# scripts/phone-run.sh. Termux's PATH has no su; Magisk keeps it on the
+# system path.
+PATH=$PATH:/product/bin:/system/bin:/debug_ramdisk:/sbin
+exec su -c '/data/local/tmp/mc/rig.sh status'
