@@ -394,6 +394,29 @@ func TestPageHasTheAllButtonsAndTheScript(t *testing.T) {
 	}
 }
 
+// A tap shows what it asked for at once and sends its command whatever is
+// outstanding: the script keeps each tile's intent, never disables a button
+// or marks a tile busy, and orders nothing by a clock.
+func TestScriptShowsATapsIntentAndNeverLocksOut(t *testing.T) {
+	_, _, console := twoCameras(t)
+	page := get(console, "/").Body.String()
+	m := script.FindStringSubmatch(page)
+	if m == nil {
+		t.Fatalf("page has no script: %q", page)
+	}
+	if !strings.Contains(m[1], "intent") {
+		t.Errorf("script keeps no intent: %q", m[1])
+	}
+	for _, gone := range []string{"disabled", "busy", "clock"} {
+		if strings.Contains(m[1], gone) {
+			t.Errorf("script still has %s: %q", gone, m[1])
+		}
+	}
+	if strings.Contains(page, ".busy") {
+		t.Errorf("page still styles a busy tile: %q", page)
+	}
+}
+
 var videoTag = regexp.MustCompile(`<video [^>]*>`)
 
 func TestStreamedTileIsVideoFedByWHEP(t *testing.T) {

@@ -11,7 +11,6 @@ button { margin: 0; padding: 0; border: 0; background: none; color: inherit; fon
 /* The bar: Start all at the left, Stop all at the right, the console's own error between. */
 header { flex: none; height: 40px; display: flex; align-items: center }
 header button { height: 100%; padding: 0 14px; display: flex; align-items: center; gap: 6px }
-header button:disabled { opacity: .4 }
 header button::before { content: ""; box-sizing: border-box; width: 20px; height: 20px }
 #start::before { border: 2px solid #fff; border-radius: 50%; background: #e00 }
 #stop::before { border-radius: 2px; background: #fff }
@@ -27,12 +26,10 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column }
 .mark { position: absolute; top: 12px; right: 12px; box-sizing: border-box; width: 22px; height: 22px; border: 2px solid #fff; border-radius: 50%; background: #e00; box-shadow: 0 0 0 1px rgba(0, 0, 0, .5) }
 .recording .mark { border: 0; border-radius: 3px; background: #fff; box-shadow: 0 0 0 2px rgba(0, 0, 0, .6) }
 
-/* The frame: red while recording, dashed when the camera's status is unread, pulsing while a command is outstanding. */
+/* The frame: red while recording, dashed when the camera's status is unread. */
 .tile::after { content: ""; position: absolute; inset: 0; pointer-events: none }
-.tile.busy::after { border: 8px solid #fff; animation: pulse .5s ease-in-out infinite alternate }
 .tile.recording::after { border: 8px solid #f00 }
 .tile.recording.stale::after { border-style: dashed }
-@keyframes pulse { to { opacity: .3 } }
 
 .error { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 10px; background: rgba(0, 0, 0, .8); color: #fd0; text-align: left; white-space: pre-line; overflow-wrap: anywhere }
 .error:empty { display: none }
@@ -56,73 +53,64 @@ const start = document.getElementById('start');
 const stop = document.getElementById('stop');
 const fault = document.getElementById('fault');
 
-// A tile's state: the camera's last known recording status, the refusal of
-// its last command, the error of its watch, whether a command is
-// outstanding, and the clock at its last command's answer.
+// A tile's state: the camera's last known recording status, what the last
+// tap asked for while the camera has yet to agree (null otherwise), the error
+// of its watch, and the refusal of its last command.
 const tiles = new Map();
 for (const el of document.querySelectorAll('.tile')) {
-	const t = {el, error: el.querySelector('.error'), recording: false, refusal: '', fault: '', busy: false, answered: 0};
+	const t = {el, error: el.querySelector('.error'), recording: false, intent: null, fault: '', refusal: ''};
 	tiles.set(el.dataset.camera, t);
-	el.onclick = () => command('/' + encodeURIComponent(el.dataset.camera) + (t.recording ? '/stop' : '/start'), [t]);
+	el.onclick = () => command('/' + encodeURIComponent(el.dataset.camera), [t], !shown(t));
 }
 const all = [...tiles.values()];
-start.onclick = () => command('/start', all);
-stop.onclick = () => command('/stop', all);
+start.onclick = () => command('', all, true);
+stop.onclick = () => command('', all, false);
 
-// clock orders events and command answers.
-let clock = 0;
+// shown is what a tile's mark shows: the tap's intent until the camera
+// agrees or refuses, else the camera's state.
+function shown(t) { return t.intent ?? t.recording; }
 
 // draw shows every tile's state. A status is unread when its camera's watch
 // failed or the console's events aren't arriving.
 function draw() {
 	const unanswered = fault.textContent !== '';
 	for (const t of all) {
-		t.el.classList.toggle('recording', t.recording);
+		t.el.classList.toggle('recording', shown(t));
 		t.el.classList.toggle('stale', unanswered || t.fault !== '');
-		t.el.classList.toggle('busy', t.busy);
-		t.error.textContent = [t.refusal, t.fault].filter(Boolean).join('\n');
-	}
-	start.disabled = stop.disabled = all.some(t => t.busy);
-}
-
-// read takes a camera's state into its tile.
-function read(t, s) {
-	if ('recording' in s) {
-		t.recording = s.recording;
-		t.fault = '';
-	} else {
-		t.fault = s.error;
+		t.error.textContent = [...new Set([t.refusal, t.fault])].filter(Boolean).join('\n');
 	}
 }
 
-// command sends the record command at path for the tiles ts, unless one of
-// them has a command outstanding, and shows its report.
-async function command(path, ts) {
-	if (ts.some(t => t.busy)) return;
-	for (const t of ts) t.busy = true;
+// command makes recording the intent of the tiles ts, shows it, and sends
+// the start or stop under base: a tap is never held back, the console queues
+// what a camera can't take yet. A camera whose report carries an error
+// refused, or is unread and can't confirm: its tile shows the error and its
+// last known state. One that agrees is shown agreeing by the console's
+// events.
+async function command(base, ts, recording) {
+	for (const t of ts) t.intent = recording;
 	draw();
+	const path = base + (recording ? '/start' : '/stop');
 	try {
 		const r = await fetch(path, {method: 'POST'});
 		if (!r.ok) throw new Error('POST ' + path + ': ' + r.status);
-		clock++;
 		for (const s of (await r.json()).cameras) {
 			const t = tiles.get(s.name);
-			t.answered = clock;
-			t.refusal = 'recording' in s && s.error || '';
-			read(t, s);
+			t.refusal = s.error || '';
+			if (t.refusal) t.intent = null;
 		}
 		fault.textContent = '';
 	} catch (e) {
+		for (const t of ts) t.intent = null;
 		fault.textContent = 'console: ' + e.message;
 	}
-	for (const t of ts) t.busy = false;
 	draw();
 }
 
 // The console pushes every camera's state on connection and then each
-// change. An event is read at its own clock, after any command answered
-// before it, and applies unless a command answered later. The browser
-// reconnects a dropped stream by itself and the states arrive again.
+// change, always the newest. A state that matches a tile's intent is the
+// camera agreeing. The browser reconnects a dropped stream by itself and the
+// states arrive again.
 const events = new EventSource('/events');
 events.onopen = () => {
 	fault.textContent = '';
@@ -136,8 +124,13 @@ events.onmessage = e => {
 	const s = JSON.parse(e.data);
 	const t = tiles.get(s.name);
 	if (!t) return;
-	const at = ++clock;
-	if (at > t.answered) read(t, s);
+	if ('recording' in s) {
+		t.recording = s.recording;
+		t.fault = '';
+		if (t.intent === t.recording) t.intent = null;
+	} else {
+		t.fault = s.error;
+	}
 	draw();
 };
 
