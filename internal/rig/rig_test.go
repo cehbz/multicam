@@ -97,6 +97,7 @@ func TestPhoneConfig(t *testing.T) {
 	want := []camera{
 		{"rx10m4", sonyBody{"wlan1", sony.DefaultEndpoint, 0}},
 		{"rx100m6", sonyBody{"cam2", sony.DefaultEndpoint, 3 * time.Second}},
+		{"pixel9", blackmagicPhone{"192.168.1.109:4444"}},
 	}
 	if err != nil || !slices.Equal(got, want) {
 		t.Errorf("parse = %v, %v; want %v", got, err, want)

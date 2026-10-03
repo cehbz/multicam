@@ -14,3 +14,11 @@ name = "rx100m6"
 kind = "sony"
 interface = "cam2"
 start_gap = "3s"
+
+# The Pixel 9, driven through Blackmagic Camera's HTTP server on the home
+# LAN; its picture is the app's livestream, received by MediaMTX on this
+# phone under the camera's name.
+[[camera]]
+name = "pixel9"
+kind = "blackmagic"
+address = "192.168.1.109:4444"
