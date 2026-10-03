@@ -417,6 +417,19 @@ func TestScriptShowsATapsIntentAndNeverLocksOut(t *testing.T) {
 	}
 }
 
+func TestScriptRequestsALostPictureAgainWhenItsCameraAnswers(t *testing.T) {
+	_, _, console := twoCameras(t)
+	m := script.FindStringSubmatch(get(console, "/").Body.String())
+	if m == nil {
+		t.Fatal("page has no script")
+	}
+	for _, want := range []string{"img.onerror", "lost", "img.src"} {
+		if !strings.Contains(m[1], want) {
+			t.Errorf("script lacks %s: %q", want, m[1])
+		}
+	}
+}
+
 var videoTag = regexp.MustCompile(`<video [^>]*>`)
 
 func TestStreamedTileIsVideoFedByWHEP(t *testing.T) {

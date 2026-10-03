@@ -55,11 +55,13 @@ const fault = document.getElementById('fault');
 
 // A tile's state: the camera's last known recording status, what the last
 // tap asked for while the camera has yet to agree (null otherwise), the error
-// of its watch, and the refusal of its last command.
+// of its watch, the refusal of its last command, and for a relayed picture
+// whether it is lost: its request failed, or its camera's watch did.
 const tiles = new Map();
 for (const el of document.querySelectorAll('.tile')) {
-	const t = {el, error: el.querySelector('.error'), recording: false, intent: null, fault: '', refusal: ''};
+	const t = {el, error: el.querySelector('.error'), img: el.querySelector('img'), recording: false, intent: null, fault: '', refusal: '', lost: false};
 	tiles.set(el.dataset.camera, t);
+	if (t.img) t.img.onerror = () => { t.lost = true; };
 	el.onclick = () => command('/' + encodeURIComponent(el.dataset.camera), [t], !shown(t));
 }
 const all = [...tiles.values()];
@@ -109,8 +111,8 @@ async function command(base, ts, recording) {
 
 // The console pushes every camera's state on connection and then each
 // change, always the newest. A state that matches a tile's intent is the
-// camera agreeing. The browser reconnects a dropped stream by itself and the
-// states arrive again.
+// camera agreeing; one without an error requests a lost picture again. The
+// browser reconnects a dropped stream by itself and the states arrive again.
 const events = new EventSource('/events');
 events.onopen = () => {
 	fault.textContent = '';
@@ -128,8 +130,13 @@ events.onmessage = e => {
 		t.recording = s.recording;
 		t.fault = '';
 		if (t.intent === t.recording) t.intent = null;
+		if (t.lost) {
+			t.lost = false;
+			t.img.src = t.img.src.split('?')[0] + '?' + Date.now();
+		}
 	} else {
 		t.fault = s.error;
+		if (t.img) t.lost = true;
 	}
 	draw();
 };
