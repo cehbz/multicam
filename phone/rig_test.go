@@ -40,14 +40,27 @@ func newRigDir(t *testing.T) *rigDir {
 		filepath.Join(dir, "links.sh"):   fakeLinks,
 		filepath.Join(dir, "links.conf"): "cam0 CAMERA secret\n",
 		filepath.Join(bin, "pidof"):      "#!/bin/sh\nexit 1\n",
+		filepath.Join(bin, "wpa_cli"):    fakeWpaCli,
+		filepath.Join(bin, "ip"):         "#!/bin/sh\n",
 	}
 	for name, body := range files {
 		if err := os.WriteFile(name, []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return &rigDir{t, dir, append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))}
+	return &rigDir{t, dir, append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_WPA="+dir)}
 }
+
+// fakeWpaCli answers `wpa_cli -p DIR -i IF CMD` from the file wpa.IF in
+// $FAKE_WPA, which holds the link's state while its supplicant runs, and
+// records each command in wpa.calls.
+const fakeWpaCli = `#!/bin/sh
+echo "$4 $5" >>"$FAKE_WPA/wpa.calls"
+case $5 in
+status) [ -e "$FAKE_WPA/wpa.$4" ] && echo "wpa_state=$(cat "$FAKE_WPA/wpa.$4")" ;;
+terminate) rm -f "$FAKE_WPA/wpa.$4" ;;
+esac
+`
 
 func (r *rigDir) cmd(args ...string) *exec.Cmd {
 	ctx, cancel := context.WithTimeout(r.t.Context(), 30*time.Second)
@@ -223,15 +236,30 @@ func TestStopIsRefusedWhileAStopRuns(t *testing.T) {
 }
 
 func TestStopWithNothingRunningSaysSo(t *testing.T) {
-	for _, args := range [][]string{{"stop"}, {"stop", "links"}} {
-		r := newRigDir(t)
-		out, err := r.cmd(args...).CombinedOutput()
-		if err == nil {
-			t.Errorf("%v succeeded", args)
-		}
-		if got := strings.TrimSpace(string(out)); got != "nothing to stop" {
-			t.Errorf("%v output %q; want %q", args, got, "nothing to stop")
-		}
+	r := newRigDir(t)
+	out, err := r.cmd("stop").CombinedOutput()
+	if err == nil {
+		t.Error("stop succeeded")
+	}
+	if got := strings.TrimSpace(string(out)); got != "nothing to stop" {
+		t.Errorf("output %q; want %q", got, "nothing to stop")
+	}
+}
+
+func TestStopEndsTheLinks(t *testing.T) {
+	r := newRigDir(t)
+	if err := os.WriteFile(r.path("wpa.cam0"), []byte("COMPLETED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.cmd("stop").CombinedOutput()
+	if err != nil {
+		t.Errorf("stop: %v (output %q)", err, out)
+	}
+	if !strings.Contains(string(out), "cam0: left CAMERA") {
+		t.Errorf("output %q; want cam0 left", out)
+	}
+	if _, err := os.Stat(r.path("wpa.cam0")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("cam0's supplicant still runs: %v", err)
 	}
 }
 

@@ -2,15 +2,15 @@
 # Runs as root on the phone: brings the rig up and down, each daemon
 # detached from the shell that starts it so it outlives an adb session or a
 # Termux:Widget tap.
-# Usage: rig.sh start | stop [links] | restart | status
+# Usage: rig.sh start | stop | restart | status
 #   start    starts MediaMTX and multicam unless they run already, then joins
 #            the cameras (links.sh); logs in mediamtx.log and multicam.log
 #            here, pids in *.pid. Fails if a camera is not joined or a daemon
 #            did not start, and is refused while a start or a stop runs.
 #   stop     ends a running start, then stops multicam, then MediaMTX (TERM,
-#            KILL after 5 s). The camera links stay up; `stop links` ends their
-#            wpa_supplicants too. Refused while a stop runs, and says "nothing
-#            to stop" when nothing runs.
+#            KILL after 5 s), then ends the camera links' wpa_supplicants.
+#            Refused while a stop runs, and says "nothing to stop" when
+#            nothing runs.
 #   restart  stops multicam and runs start.
 # rig.pid holds the pid of the start or stop running.
 #   status   what is running, each link's state and the console URL; succeeds
@@ -26,6 +26,7 @@ MULTICAM=/data/local/tmp/multicam
 OWNER=$D/rig.pid
 MEDIAMTX=$D/mtx/mediamtx
 CONSOLE=http://localhost:8080/
+PATH=$BIN:$PATH
 SETSID=$(command -v setsid)
 
 # Pids of the processes running exe, by name: a binary pushed over a running
@@ -144,7 +145,7 @@ cameras() { grep -v -E '^[[:space:]]*(#|$)' "$D/links.conf"; }
 cli() {
 	iface=$1
 	shift
-	$BIN/wpa_cli -p "$D/ctrl" -i "$iface" "$@" 2>/dev/null
+	wpa_cli -p "$D/ctrl" -i "$iface" "$@" 2>/dev/null
 }
 state() { cli "$1" status | sed -n 's/^wpa_state=//p'; }
 addr() { ip -4 addr show dev "$1" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p'; }
@@ -214,7 +215,7 @@ stop() {
 		busy=1
 	fi
 	[ -n "$(pids "$MULTICAM")$(pids "$MEDIAMTX")" ] && busy=1
-	[ "$1" = links ] && links_up && busy=1
+	links_up && busy=1
 	if [ $busy = 0 ]; then
 		release
 		echo "nothing to stop"
@@ -223,7 +224,7 @@ stop() {
 	rc=0
 	stop_daemon multicam "$MULTICAM" || rc=1
 	stop_daemon mediamtx "$MEDIAMTX" || rc=1
-	[ "$1" = links ] && stop_links
+	stop_links
 	release
 	return $rc
 }
@@ -239,14 +240,14 @@ status() {
 
 case "${1:-}" in
 start) start ;;
-stop) stop "${2:-}" ;;
+stop) stop ;;
 restart)
 	start_refused && exit 1
 	stop_daemon multicam "$MULTICAM" && start
 	;;
 status) status ;;
 *)
-	echo "usage: rig.sh start | stop [links] | restart | status" >&2
+	echo "usage: rig.sh start | stop | restart | status" >&2
 	exit 2
 	;;
 esac
