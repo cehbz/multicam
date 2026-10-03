@@ -41,7 +41,9 @@ start_daemon() {
 	shift 3
 	p=$(pids "$exe")
 	if [ -z "$p" ]; then
-		(cd "$dir" && $SETSID nohup "$exe" "$@" >>"$D/$name.log" 2>&1 </dev/null &)
+		# The launching subshell drops its own stdio too: it lingers as the
+		# daemon's parent on this phone and would hold an adb session open.
+		(cd "$dir" && $SETSID nohup "$exe" "$@" >>"$D/$name.log" 2>&1 </dev/null &) >/dev/null 2>&1 </dev/null
 		sleep 1
 		p=$(pids "$exe")
 	fi
