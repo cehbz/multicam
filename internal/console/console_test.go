@@ -417,16 +417,19 @@ func TestScriptShowsATapsIntentAndNeverLocksOut(t *testing.T) {
 	}
 }
 
-func TestScriptRequestsALostPictureAgainWhenItsCameraAnswers(t *testing.T) {
+var retry = regexp.MustCompile(`onerror = \(\) => setTimeout\([^,]*\.src = [^,]*, 2000\)`)
+
+func TestScriptRequestsAFailedPictureAgain2sLater(t *testing.T) {
 	_, _, console := twoCameras(t)
 	m := script.FindStringSubmatch(get(console, "/").Body.String())
 	if m == nil {
 		t.Fatal("page has no script")
 	}
-	for _, want := range []string{"img.onerror", "lost", "img.src"} {
-		if !strings.Contains(m[1], want) {
-			t.Errorf("script lacks %s: %q", want, m[1])
-		}
+	if !retry.MatchString(m[1]) {
+		t.Errorf("script does not request a failed picture again 2 s later: %q", m[1])
+	}
+	if strings.Contains(m[1], "lost") {
+		t.Errorf("script still requests a picture again on a camera's state: %q", m[1])
 	}
 }
 
