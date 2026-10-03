@@ -15,11 +15,11 @@
 # rig.pid holds the pid of the start or stop running.
 #   status   what is running, each link's state and the console URL; succeeds
 #            when the whole rig is up.
-# Termux:Widget (from F-Droid) runs the scripts in ~/.shortcuts of Termux's
-# home (/data/data/com.termux/files/home/.shortcuts, executable and owned by
-# the Termux user) and shows their output. phone/shortcuts in the repo holds
-# "Start rig", "Stop rig" and "Rig status", which call this script through
-# su; scripts/phone-run.sh pushes them with this script.
+# Termux:Widget runs the scripts in ~/.shortcuts/tasks of Termux's home
+# (/data/data/com.termux/files/home/.shortcuts/tasks, executable and owned by
+# the Termux user) in the background. phone/shortcuts/tasks in the repo holds
+# "Start rig", "Stop rig" and "Rig status", which run notify.sh through su;
+# scripts/phone-run.sh pushes them with this script.
 BIN=/data/data/com.termux/files/usr/bin
 D=$(cd "$(dirname "$0")" && pwd)
 MULTICAM=/data/local/tmp/multicam

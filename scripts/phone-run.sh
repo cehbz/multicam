@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cross-build multicam and push it, the rig's config, the phone scripts
-# (phone/*.sh to /data/local/tmp/mc) and the Termux:Widget shortcuts (to
-# ~/.shortcuts in Termux's home) over adb, then restart the server through
+# (phone/*.sh to /data/local/tmp/mc) and the Termux:Widget tasks (to
+# ~/.shortcuts/tasks in Termux's home) over adb, then restart the server through
 # rig.sh so it runs detached from this session, with the console port
 # forwarded to this Mac. With --foreground the server instead runs in this
 # adb session as root and Ctrl-C stops it; the camera links and MediaMTX stay
@@ -35,25 +35,25 @@ adb push "$bin" "$remote.new" >/dev/null || exit 1
 adb shell "mv $remote.new $remote && chmod 755 $remote" || exit 1
 adb shell "mkdir -p $mc/shortcuts" || exit 1
 adb push "$repo/multicam.phone.toml" "$config" >/dev/null || exit 1
-adb push "$repo/phone/links.sh" "$repo/phone/udhcpc.sh" "$repo/phone/rig.sh" "$mc/" >/dev/null || exit 1
-adb shell "chmod 755 $mc/links.sh $mc/udhcpc.sh $mc/rig.sh" || exit 1
+adb push "$repo/phone/links.sh" "$repo/phone/udhcpc.sh" "$repo/phone/rig.sh" "$repo/phone/notify.sh" "$mc/" >/dev/null || exit 1
+adb shell "chmod 755 $mc/links.sh $mc/udhcpc.sh $mc/rig.sh $mc/notify.sh" || exit 1
 if [[ -f $repo/phone/links.conf ]]; then
 	adb push "$repo/phone/links.conf" "$mc/" >/dev/null || exit 1
 	adb shell "chmod 600 $mc/links.conf" || exit 1
 fi
 
-# Termux's home is private to its uid, so the shortcuts go in as root and are
+# Termux's home is private to its uid, so the tasks go in as root and are
 # given back to that uid with the SELinux label its files carry.
 owner=$(adb shell "su -c 'stat -c %u:%g $termux_home'" | tr -d '\r')
 [[ $owner =~ ^[0-9]+:[0-9]+$ ]] || {
 	echo "could not read the owner of $termux_home" >&2
 	exit 1
 }
-adb push "$repo"/phone/shortcuts/* "$mc/shortcuts/" >/dev/null || exit 1
-adb shell "su -c 'mkdir -p $termux_home/.shortcuts &&
-	cp $mc/shortcuts/* $termux_home/.shortcuts/ &&
+adb push "$repo"/phone/shortcuts/tasks/* "$mc/shortcuts/" >/dev/null || exit 1
+adb shell "su -c 'mkdir -p $termux_home/.shortcuts/tasks &&
+	cp $mc/shortcuts/* $termux_home/.shortcuts/tasks/ &&
 	chown -R $owner $termux_home/.shortcuts &&
-	chmod 700 $termux_home/.shortcuts $termux_home/.shortcuts/* &&
+	chmod 700 $termux_home/.shortcuts $termux_home/.shortcuts/tasks $termux_home/.shortcuts/tasks/* &&
 	restorecon -RD $termux_home/.shortcuts'" || exit 1
 
 adb forward "tcp:$port" "tcp:$port" >/dev/null || exit 1
