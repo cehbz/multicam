@@ -30,6 +30,12 @@ func TestParse(t *testing.T) {
 			text: "[[camera]]\nname = \"fake-1\"\nkind = \"sony\"\nendpoint = \"http://127.0.0.1:9/sony/camera\"\n",
 			want: []camera{{"fake-1", sonyBody{"", "http://127.0.0.1:9/sony/camera"}}},
 		},
+		{
+			name: "Blackmagic camera at its address",
+			text: "[[camera]]\nname = \"pixel9\"\nkind = \"blackmagic\"\naddress = \"192.168.1.9:4444\"\n",
+			want: []camera{{"pixel9", blackmagicPhone{"192.168.1.9:4444"}}},
+		},
+		{name: "Blackmagic camera without an address", text: "[[camera]]\nname = \"a\"\nkind = \"blackmagic\"\n", wantErr: `camera 1 (a): address "" is not the phone's HTTP server address and port`},
 		{name: "no cameras", text: "", wantErr: "no cameras"},
 		{name: "camera without a name", text: "[[camera]]\nkind = \"sony\"\n", wantErr: "camera 1"},
 		{name: "empty name", text: "[[camera]]\nname = \"\"\nkind = \"sony\"\n", wantErr: "camera 1"},
@@ -44,10 +50,10 @@ func TestParse(t *testing.T) {
 		{
 			name:    "no kind",
 			text:    "[[camera]]\nname = \"rx10m4\"\ninterface = \"wlan1\"\n",
-			wantErr: `camera 1 (rx10m4): no kind: add kind = "sony"`,
+			wantErr: `camera 1 (rx10m4): no kind: add kind = "sony" or kind = "blackmagic"`,
 		},
-		{name: "unknown kind", text: "[[camera]]\nname = \"a\"\nkind = \"gopro\"\n", wantErr: `camera 1 (a): kind "gopro" is not "sony"`},
-		{name: "the Pixel kind is gone", text: "[[camera]]\nname = \"a\"\nkind = \"pixel\"\naddress = \"1.2.3.4:5\"\n", wantErr: `camera 1 (a): kind "pixel" is not "sony"`},
+		{name: "unknown kind", text: "[[camera]]\nname = \"a\"\nkind = \"gopro\"\n", wantErr: `camera 1 (a): kind "gopro" is not "sony" or "blackmagic"`},
+		{name: "the Pixel kind is gone", text: "[[camera]]\nname = \"a\"\nkind = \"pixel\"\naddress = \"1.2.3.4:5\"\n", wantErr: `camera 1 (a): kind "pixel" is not "sony" or "blackmagic"`},
 		{
 			name:    "misspelled key",
 			text:    "[[camera]]\nname = \"a\"\nkind = \"sony\"\ninteface = \"wlan1\"\n",

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"regexp"
 	"slices"
@@ -71,6 +72,17 @@ func (b sonyBody) open() (console.Camera, error) {
 	return console.Adapt(cam), nil
 }
 
+// blackmagicPhone is a phone running Blackmagic Camera (kind "blackmagic"):
+// the address of the app's HTTP server. Its picture is a stream the console
+// doesn't show yet, so it can't be opened.
+type blackmagicPhone struct {
+	Address string
+}
+
+func (p blackmagicPhone) open() (console.Camera, error) {
+	return nil, errors.New("the console can't show a Blackmagic camera yet")
+}
+
 // settings is the keys of one [[camera]] table. take removes the ones read;
 // the ones left are unknown to the camera's kind.
 type settings struct {
@@ -130,10 +142,16 @@ func parse(text string) ([]camera, error) {
 				body.Endpoint = sony.DefaultEndpoint
 			}
 			c.Kind = body
+		case "blackmagic":
+			phone := blackmagicPhone{Address: s.take("address")}
+			if _, _, err := net.SplitHostPort(phone.Address); err != nil {
+				kindErr = fmt.Errorf("address %q is not the phone's HTTP server address and port", phone.Address)
+			}
+			c.Kind = phone
 		case "":
-			kindErr = errors.New(`no kind: add kind = "sony"`)
+			kindErr = errors.New(`no kind: add kind = "sony" or kind = "blackmagic"`)
 		default:
-			kindErr = fmt.Errorf(`kind %q is not "sony"`, kindName)
+			kindErr = fmt.Errorf(`kind %q is not "sony" or "blackmagic"`, kindName)
 		}
 		if kindErr == nil {
 			kindErr = s.err
