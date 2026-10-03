@@ -13,14 +13,30 @@ import (
 	"time"
 )
 
-// fakeLinks stands in for links.sh: it records each run and its pid, then
-// waits until the test creates links.release.
-const fakeLinks = `echo $$ >>"$(dirname "$0")/links.runs"
-while [ ! -e "$(dirname "$0")/links.release" ]; do sleep 0.05; done
+// fakeLinks stands in for the link keeper: it records its pid in links.runs
+// and runs until it is ended.
+const fakeLinks = `#!/bin/sh
+echo $$ >>"$(dirname "$0")/links.runs"
+while :; do sleep 0.05; done
 `
 
-// rigDir is a copy of rig.sh beside a fake links.sh and a one-camera
-// links.conf, with a pidof on PATH that finds no daemon.
+// fakePidof finds no daemon. Called from a start while $RIG_HOLD exists, it
+// records its pid in $RIG_HOLD.runs and waits until the file is gone, which
+// holds the start before it starts anything.
+const fakePidof = `#!/bin/sh
+case $(ps -o args= -p $PPID) in
+*"rig.sh start"*)
+	if [ -e "$RIG_HOLD" ]; then
+		echo $$ >>"$RIG_HOLD.runs"
+		while [ -e "$RIG_HOLD" ]; do sleep 0.05; done
+	fi
+	;;
+esac
+exit 1
+`
+
+// rigDir is a copy of rig.sh beside a fake link keeper and a one-camera
+// links.conf, with fakes of pidof, wpa_cli and ip on PATH.
 type rigDir struct {
 	t   *testing.T
 	dir string
@@ -39,7 +55,7 @@ func newRigDir(t *testing.T) *rigDir {
 		filepath.Join(dir, "rig.sh"):     string(rig),
 		filepath.Join(dir, "links.sh"):   fakeLinks,
 		filepath.Join(dir, "links.conf"): "cam0 CAMERA secret\n",
-		filepath.Join(bin, "pidof"):      "#!/bin/sh\nexit 1\n",
+		filepath.Join(bin, "pidof"):      fakePidof,
 		filepath.Join(bin, "wpa_cli"):    fakeWpaCli,
 		filepath.Join(bin, "ip"):         "#!/bin/sh\n",
 	}
@@ -48,7 +64,13 @@ func newRigDir(t *testing.T) *rigDir {
 			t.Fatal(err)
 		}
 	}
-	return &rigDir{t, dir, append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_WPA="+dir)}
+	r := &rigDir{t, dir, append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_WPA="+dir, "RIG_HOLD="+filepath.Join(dir, "hold"))}
+	t.Cleanup(func() {
+		for _, p := range r.runs() {
+			syscall.Kill(p, syscall.SIGKILL)
+		}
+	})
+	return r
 }
 
 // fakeWpaCli answers `wpa_cli -p DIR -i IF CMD` from the file wpa.IF in
@@ -73,9 +95,14 @@ func (r *rigDir) cmd(args ...string) *exec.Cmd {
 
 func (r *rigDir) path(name string) string { return filepath.Join(r.dir, name) }
 
-// runs is the pids of the links.sh runs so far.
-func (r *rigDir) runs() []int {
-	b, _ := os.ReadFile(r.path("links.runs"))
+// runs is the pids of the link keepers started so far.
+func (r *rigDir) runs() []int { return r.pids("links.runs") }
+
+// held is the pids of the fake pidofs holding a start.
+func (r *rigDir) held() []int { return r.pids("hold.runs") }
+
+func (r *rigDir) pids(name string) []int {
+	b, _ := os.ReadFile(r.path(name))
 	var pids []int
 	for f := range strings.FieldsSeq(string(b)) {
 		p, err := strconv.Atoi(f)
@@ -87,25 +114,30 @@ func (r *rigDir) runs() []int {
 	return pids
 }
 
-// startBlocked starts a start and returns once it is inside links.sh.
+// startBlocked starts a start and returns once it is held, before it has
+// started anything.
 func (r *rigDir) startBlocked() *exec.Cmd {
 	r.t.Helper()
+	if err := os.WriteFile(r.path("hold"), nil, 0o644); err != nil {
+		r.t.Fatal(err)
+	}
 	start := r.cmd("start")
 	if err := start.Start(); err != nil {
 		r.t.Fatal(err)
 	}
 	r.t.Cleanup(func() { start.Process.Kill() })
-	for deadline := time.Now().Add(5 * time.Second); len(r.runs()) == 0; {
+	for deadline := time.Now().Add(5 * time.Second); len(r.held()) == 0; {
 		if time.Now().After(deadline) {
-			r.t.Fatal("the start never reached links.sh")
+			r.t.Fatal("the start was never held")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	return start
 }
 
+// release lets a held start go on.
 func (r *rigDir) release() {
-	if err := os.WriteFile(r.path("links.release"), nil, 0o644); err != nil {
+	if err := os.Remove(r.path("hold")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		r.t.Fatal(err)
 	}
 }
@@ -150,8 +182,8 @@ func TestStartIsRefusedWhileAStartRuns(t *testing.T) {
 	if want := "start: already running (pid " + strconv.Itoa(first.Process.Pid) + ")"; !strings.Contains(string(out), want) {
 		t.Errorf("output %q; want %q", out, want)
 	}
-	if n := len(r.runs()); n != 1 {
-		t.Errorf("links.sh ran %d times; want 1", n)
+	if n := len(r.runs()); n != 0 {
+		t.Errorf("the refused start launched %d keepers", n)
 	}
 	r.release()
 	first.Wait()
@@ -170,10 +202,9 @@ func TestStartIgnoresAnOwnerThatIsNotARigAction(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			r := newRigDir(t)
 			r.holdRig(pid)
-			r.release()
 			out, _ := r.cmd("start").CombinedOutput()
 			if n := len(r.runs()); n != 1 {
-				t.Errorf("links.sh ran %d times; want 1 (output %q)", n, out)
+				t.Errorf("start launched %d keepers; want 1 (output %q)", n, out)
 			}
 			r.noOwner()
 		})
@@ -183,7 +214,7 @@ func TestStartIgnoresAnOwnerThatIsNotARigAction(t *testing.T) {
 func TestStopEndsARunningStart(t *testing.T) {
 	r := newRigDir(t)
 	start := r.startBlocked()
-	links := r.runs()[0]
+	holder := r.held()[0]
 
 	out, err := r.cmd("stop").CombinedOutput()
 	if err != nil {
@@ -197,8 +228,8 @@ func TestStopEndsARunningStart(t *testing.T) {
 	if !errors.As(err, &exit) || exit.Sys().(syscall.WaitStatus).Signal() != syscall.SIGTERM {
 		t.Errorf("start ended with %v; want SIGTERM", err)
 	}
-	if alive(links) {
-		t.Errorf("links.sh (pid %d) outlived the stop", links)
+	if alive(holder) {
+		t.Errorf("the start's child (pid %d) outlived the stop", holder)
 	}
 	r.noOwner()
 }
@@ -207,7 +238,6 @@ func TestStartIsRefusedWhileAStopRuns(t *testing.T) {
 	r := newRigDir(t)
 	stop := stopHolder(t)
 	r.holdRig(stop)
-	r.release()
 
 	out, err := r.cmd("start").CombinedOutput()
 	if err == nil {
@@ -217,7 +247,7 @@ func TestStartIsRefusedWhileAStopRuns(t *testing.T) {
 		t.Errorf("output %q; want %q", out, want)
 	}
 	if n := len(r.runs()); n != 0 {
-		t.Errorf("links.sh ran %d times; want 0", n)
+		t.Errorf("the refused start launched %d keepers", n)
 	}
 }
 
@@ -263,31 +293,42 @@ func TestStopEndsTheLinks(t *testing.T) {
 	}
 }
 
-func TestStartBringsTheDaemonsUpBeforeTheLinks(t *testing.T) {
+func TestStartLaunchesTheKeeperAfterTheDaemonsAndReturns(t *testing.T) {
 	r := newRigDir(t)
-	out, err := os.Create(r.path("start.out"))
+	out, _ := r.cmd("start").CombinedOutput()
+	keepers := r.runs()
+	if len(keepers) != 1 {
+		t.Fatalf("start launched %d keepers; want 1 (output %q)", len(keepers), out)
+	}
+	if !alive(keepers[0]) {
+		t.Error("the keeper ended with the start")
+	}
+	daemons, keeper := strings.Index(string(out), "multicam:"), strings.Index(string(out), "links: running")
+	if daemons < 0 || keeper < daemons {
+		t.Errorf("output %q; want the daemons, then the keeper running", out)
+	}
+	if status, _ := r.cmd("status").CombinedOutput(); !strings.Contains(string(status), "links: running") {
+		t.Errorf("status %q does not report the keeper", status)
+	}
+}
+
+func TestStopEndsTheKeeperBeforeTheLinks(t *testing.T) {
+	r := newRigDir(t)
+	r.cmd("start").Run()
+	if err := os.WriteFile(r.path("wpa.cam0"), []byte("COMPLETED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.cmd("stop").CombinedOutput()
 	if err != nil {
-		t.Fatal(err)
+		t.Errorf("stop: %v (output %q)", err, out)
 	}
-	defer out.Close()
-	start := r.cmd("start")
-	start.Stdout, start.Stderr = out, out
-	if err := start.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { start.Process.Kill() })
-	for deadline := time.Now().Add(10 * time.Second); len(r.runs()) == 0; {
-		if time.Now().After(deadline) {
-			t.Fatal("the start never reached links.sh")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	b, _ := os.ReadFile(r.path("start.out"))
-	for _, daemon := range []string{"mediamtx:", "multicam:"} {
-		if !strings.Contains(string(b), daemon) {
-			t.Errorf("links.sh ran before %s was reported (output %q)", daemon, b)
+	for _, p := range r.runs() {
+		if alive(p) {
+			t.Errorf("the keeper (pid %d) outlived the stop", p)
 		}
 	}
-	r.release()
-	start.Wait()
+	keeper, link := strings.Index(string(out), "links: stopped"), strings.Index(string(out), "cam0: left")
+	if keeper < 0 || link < keeper {
+		t.Errorf("output %q; want the keeper stopped, then the link left", out)
+	}
 }

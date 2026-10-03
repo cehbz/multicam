@@ -3,12 +3,14 @@
 # detached from the shell that starts it so it outlives an adb session or a
 # Termux:Widget tap.
 # Usage: rig.sh start | stop | restart | status
-#   start    starts MediaMTX and multicam unless they run already, then joins
-#            the cameras (links.sh); logs in mediamtx.log and multicam.log
-#            here, pids in *.pid. Fails if a camera is not joined or a daemon
-#            did not start, and is refused while a start or a stop runs.
-#   stop     ends a running start, then stops multicam, then MediaMTX (TERM,
-#            KILL after 5 s), then ends the camera links' wpa_supplicants.
+#   start    starts MediaMTX, multicam and the link keeper (links.sh, which
+#            keeps the cameras joined) unless they run already; logs in
+#            mediamtx.log, multicam.log and links.log here, pids in *.pid.
+#            Fails if one did not start, and is refused while a start or a
+#            stop runs.
+#   stop     ends a running start, then stops multicam, MediaMTX and the link
+#            keeper (TERM, KILL after 5 s), then ends the camera links'
+#            wpa_supplicants.
 #            Refused while a stop runs, and says "nothing to stop" when
 #            nothing runs.
 #   restart  stops multicam and runs start.
@@ -25,14 +27,19 @@ D=$(cd "$(dirname "$0")" && pwd)
 MULTICAM=/data/local/tmp/multicam
 OWNER=$D/rig.pid
 MEDIAMTX=$D/mtx/mediamtx
+KEEPER=$D/links.sh
 CONSOLE=http://localhost:8080/
 PATH=$BIN:$PATH
 SETSID=$(command -v setsid)
 
-# Pids of the processes running exe, by name: a binary pushed over a running
-# one keeps its name, and a scan of /proc/*/exe takes 15 s on this phone.
+# Pids of the processes running exe. A binary is found by name: one pushed
+# over a running one keeps its name, and a scan of /proc/*/exe takes 15 s on
+# this phone. A script runs as sh, so it is found by its arguments.
 pids() {
-	pidof "${1##*/}"
+	case $1 in
+	*.sh) pgrep -f "^[^ ]*sh $1\$" ;;
+	*) pidof "${1##*/}" ;;
+	esac
 }
 
 # Starts exe in dir with the remaining arguments unless it runs already,
@@ -194,8 +201,7 @@ start() {
 	start_daemon mediamtx "$MEDIAMTX" "$D/mtx" || rc=1
 	start_daemon multicam "$MULTICAM" "$D" "$D/multicam.toml" || rc=1
 	echo "console: $CONSOLE"
-	sh "$D/links.sh" || rc=1
-	links_status >/dev/null || rc=1
+	start_daemon links "$KEEPER" "$D" || rc=1
 	release
 	return $rc
 }
@@ -214,7 +220,7 @@ stop() {
 		end_start "${o#start }"
 		busy=1
 	fi
-	[ -n "$(pids "$MULTICAM")$(pids "$MEDIAMTX")" ] && busy=1
+	[ -n "$(pids "$MULTICAM")$(pids "$MEDIAMTX")$(pids "$KEEPER")" ] && busy=1
 	links_up && busy=1
 	if [ $busy = 0 ]; then
 		release
@@ -224,6 +230,7 @@ stop() {
 	rc=0
 	stop_daemon multicam "$MULTICAM" || rc=1
 	stop_daemon mediamtx "$MEDIAMTX" || rc=1
+	stop_daemon links "$KEEPER" || rc=1
 	stop_links
 	release
 	return $rc
@@ -233,6 +240,7 @@ status() {
 	rc=0
 	report multicam "$MULTICAM" || rc=1
 	report mediamtx "$MEDIAMTX" || rc=1
+	report links "$KEEPER" || rc=1
 	links_status || rc=1
 	echo "console: $CONSOLE"
 	return $rc
