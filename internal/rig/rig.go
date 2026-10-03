@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"net"
 	"os"
@@ -112,19 +111,8 @@ type blackmagicPhone struct {
 }
 
 func (p blackmagicPhone) open(name string) (console.Named, error) {
-	cam := blackmagicCamera{blackmagic.NewCamera(p.Address)}
+	cam := blackmagic.NewCamera(p.Address)
 	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: cam}, nil
-}
-
-// blackmagicCamera is a Blackmagic camera as the console watches it: each
-// watch first makes sure the app is streaming, so MediaMTX has its picture.
-type blackmagicCamera struct{ *blackmagic.Camera }
-
-func (c blackmagicCamera) Watch(ctx context.Context) (<-chan bool, error) {
-	if err := c.EnsureStreaming(ctx); err != nil {
-		slog.Error("livestream", "err", err)
-	}
-	return c.Camera.Watch(ctx)
 }
 
 // settings is the keys of one [[camera]] table. take removes the ones read;

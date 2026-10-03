@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -107,6 +108,12 @@ func (c *Camera) Recording(ctx context.Context) (bool, error) {
 	return r.Recording, nil
 }
 
+// livestream is the livestream property's value, as the pushed event carries
+// it.
+type livestream struct {
+	Status string `json:"status"`
+}
+
 // eventMessage is one message from the notification socket; only
 // propertyValueChanged events carry a value.
 type eventMessage struct {
@@ -120,14 +127,16 @@ type eventMessage struct {
 
 // Watch reports the recording state as the camera pushes it: the state read
 // over REST first, then each change from the notification socket. The channel
-// closes when ctx ends or the socket drops.
+// closes when ctx ends or the socket drops. While it watches, it starts the
+// livestream whenever its pushed status turns Idle; the app pushes the status
+// on subscribing, so a stream not running when the watch begins is started.
 func (c *Camera) Watch(ctx context.Context) (<-chan bool, error) {
 	conn, _, err := websocket.Dial(ctx, c.url("wss", EventPath), &websocket.DialOptions{HTTPClient: c.http})
 	if err != nil {
 		return nil, fmt.Errorf("event websocket: %w", err)
 	}
 	subscribe := map[string]any{"type": "request", "data": map[string]any{
-		"action": "subscribe", "properties": []string{RecordPath}}}
+		"action": "subscribe", "properties": []string{RecordPath, LivestreamPath}}}
 	if err := wsjson.Write(ctx, conn, subscribe); err != nil {
 		conn.CloseNow()
 		return nil, fmt.Errorf("subscribe: %w", err)
@@ -154,42 +163,37 @@ func (c *Camera) Watch(ctx context.Context) (<-chan bool, error) {
 		if !deliver(current) {
 			return
 		}
+		status := ""
 		for {
 			var m eventMessage
 			if err := wsjson.Read(ctx, conn, &m); err != nil {
 				return
 			}
-			if m.Type != "event" || m.Data.Action != "propertyValueChanged" || m.Data.Property != RecordPath {
+			if m.Type != "event" || m.Data.Action != "propertyValueChanged" {
 				continue
 			}
-			var r record
-			if err := json.Unmarshal(m.Data.Value, &r); err != nil {
-				continue
-			}
-			if !deliver(r.Recording) {
-				return
+			switch m.Data.Property {
+			case RecordPath:
+				var r record
+				if err := json.Unmarshal(m.Data.Value, &r); err != nil {
+					continue
+				}
+				if !deliver(r.Recording) {
+					return
+				}
+			case LivestreamPath:
+				var ls livestream
+				if err := json.Unmarshal(m.Data.Value, &ls); err != nil {
+					continue
+				}
+				if ls.Status == StatusIdle && status != StatusIdle {
+					if _, err := c.call(ctx, http.MethodPut, LivestreamStartPath); err != nil && ctx.Err() == nil {
+						slog.Error("livestream", "err", err)
+					}
+				}
+				status = ls.Status
 			}
 		}
 	}()
 	return ch, nil
-}
-
-// EnsureStreaming starts the livestream to the configured platform unless
-// one is already running.
-func (c *Camera) EnsureStreaming(ctx context.Context) error {
-	body, err := c.call(ctx, http.MethodGet, LivestreamPath)
-	if err != nil {
-		return err
-	}
-	var ls struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(body, &ls); err != nil {
-		return fmt.Errorf("GET %s: %w", LivestreamPath, err)
-	}
-	if ls.Status != StatusIdle {
-		return nil
-	}
-	_, err = c.call(ctx, http.MethodPut, LivestreamStartPath)
-	return err
 }

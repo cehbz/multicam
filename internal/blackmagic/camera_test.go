@@ -27,10 +27,12 @@ type fake struct {
 	livestream string // status of /livestreams/0
 	fail       string // "METHOD path" answered with 500
 
-	// pushes are delivered on the event socket after the subscribe request;
-	// subscribed receives the subscribe request's JSON.
-	pushes     []bool
-	subscribed chan json.RawMessage
+	// pushes are record states and streamPushes livestream statuses,
+	// delivered on the event socket after the subscribe request in that
+	// order; subscribed receives the subscribe request's JSON.
+	pushes       []bool
+	streamPushes []string
+	subscribed   chan json.RawMessage
 }
 
 func newFake(t *testing.T) *fake {
@@ -96,6 +98,10 @@ func (f *fake) events(w http.ResponseWriter, r *http.Request) {
 	for _, v := range f.pushes {
 		wsjson.Write(ctx, conn, map[string]any{"type": "event", "data": map[string]any{
 			"action": "propertyValueChanged", "property": RecordPath, "value": map[string]any{"recording": v}}})
+	}
+	for _, s := range f.streamPushes {
+		wsjson.Write(ctx, conn, map[string]any{"type": "event", "data": map[string]any{
+			"action": "propertyValueChanged", "property": LivestreamPath, "value": map[string]any{"status": s, "bitrate": 0}}})
 	}
 	// Hold the socket open until the client goes away.
 	conn.Read(ctx)
@@ -179,7 +185,7 @@ func TestWatchDeliversRESTStateThenPushes(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no subscribe request")
 	}
-	if sub.Type != "request" || sub.Data.Action != "subscribe" || !slices.Equal(sub.Data.Properties, []string{"/transports/0/record"}) {
+	if sub.Type != "request" || sub.Data.Action != "subscribe" || !slices.Equal(sub.Data.Properties, []string{"/transports/0/record", "/livestreams/0"}) {
 		t.Errorf("subscribe request %+v", sub)
 	}
 
@@ -218,41 +224,31 @@ func TestWatchFailsWhenStateUnreadable(t *testing.T) {
 	}
 }
 
-func TestEnsureStreamingStartsOnlyWhenIdle(t *testing.T) {
-	for _, tc := range []struct {
-		status string
-		start  bool
-	}{
-		{"Idle", true},
-		{"Connecting", false},
-		{"Streaming", false},
-		{"Interrupted", false},
-	} {
-		t.Run(tc.status, func(t *testing.T) {
-			f := newFake(t)
-			f.livestream = tc.status
-			if err := NewCamera(f.Address()).EnsureStreaming(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			want := []string{"GET /livestreams/0"}
-			if tc.start {
-				want = append(want, "PUT /livestreams/0/start")
-			}
-			if got := f.Calls(); !slices.Equal(got, want) {
-				t.Errorf("calls %v, want %v", got, want)
-			}
-		})
-	}
-}
-
-func TestEnsureStreamingReportsFailedStart(t *testing.T) {
+func TestWatchStartsTheLivestreamWhenItTurnsIdle(t *testing.T) {
 	f := newFake(t)
-	f.fail = "PUT /livestreams/0/start"
-	err := NewCamera(f.Address()).EnsureStreaming(t.Context())
-	if err == nil {
-		t.Fatal("EnsureStreaming succeeded on a 500")
+	f.streamPushes = []string{"Idle", "Connecting", "Streaming", "Idle", "Idle", "Idle", "Streaming"}
+	ch, err := NewCamera(f.Address()).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "500") {
-		t.Errorf("error %q does not name the HTTP status", err)
+	go func() {
+		for range ch {
+		}
+	}()
+	starts := func() int {
+		n := 0
+		for _, c := range f.Calls() {
+			if c == "PUT /livestreams/0/start" {
+				n++
+			}
+		}
+		return n
+	}
+	for deadline := time.Now().Add(5 * time.Second); starts() < 2 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := starts(); n != 2 {
+		t.Errorf("livestream started %d times, want 2 (calls %v)", n, f.Calls())
 	}
 }
