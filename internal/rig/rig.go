@@ -3,8 +3,10 @@
 package rig
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net"
 	"os"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/cehbz/multicam/internal/blackmagic"
 	"github.com/cehbz/multicam/internal/console"
 	"github.com/cehbz/multicam/internal/sony"
 )
@@ -36,11 +39,11 @@ func Load(path string) (*Rig, error) {
 	}
 	rig := &Rig{}
 	for _, c := range cameras {
-		cam, err := c.Kind.open()
+		cam, err := c.Kind.open(c.Name)
 		if err != nil {
 			return nil, fmt.Errorf("%s: camera %s: %w", path, c.Name, err)
 		}
-		rig.Cameras = append(rig.Cameras, console.Named{Name: c.Name, Camera: cam})
+		rig.Cameras = append(rig.Cameras, cam)
 	}
 	return rig, nil
 }
@@ -52,39 +55,76 @@ type camera struct {
 	Kind kind
 }
 
-// kind is what a camera's table says beyond its name; open makes the camera.
+// kind is what a camera's table says beyond its name; open makes the camera
+// under name.
 type kind interface {
-	open() (console.Camera, error)
+	open(name string) (console.Named, error)
 }
 
 // sonyBody is a Sony body (kind "sony"): the network interface it is reached
 // on (empty: the system's route), its camera service endpoint
 // (sony.DefaultEndpoint when left out) and the gap a start keeps after the
-// body reports IDLE (start_gap, a duration; none when left out).
+// body reports IDLE (start_gap, a duration; none when left out). The console
+// relays its liveview.
 type sonyBody struct {
 	Interface string
 	Endpoint  string
 	StartGap  time.Duration
 }
 
-func (b sonyBody) open() (console.Camera, error) {
+func (b sonyBody) open(name string) (console.Named, error) {
 	cam, err := sony.NewCamera(b.Endpoint, b.Interface)
+	if err != nil {
+		return console.Named{}, err
+	}
+	cam.StartGap = b.StartGap
+	return console.Named{Name: name, Picture: console.Relay(cam), Camera: sonyCamera{cam}}, nil
+}
+
+// sonyCamera is a Sony body as the console watches it: recording while its
+// status is MovieRecording.
+type sonyCamera struct{ *sony.Camera }
+
+func (c sonyCamera) Watch(ctx context.Context) (<-chan bool, error) {
+	statuses, err := c.Camera.Watch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	cam.StartGap = b.StartGap
-	return console.Adapt(cam), nil
+	ch := make(chan bool)
+	go func() {
+		defer close(ch)
+		for s := range statuses {
+			select {
+			case ch <- s == "MovieRecording":
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
 }
 
 // blackmagicPhone is a phone running Blackmagic Camera (kind "blackmagic"):
-// the address of the app's HTTP server. Its picture is a stream the console
-// doesn't show yet, so it can't be opened.
+// the address of the app's HTTP server. Its picture is the app's livestream,
+// which the page plays from MediaMTX under the camera's name.
 type blackmagicPhone struct {
 	Address string
 }
 
-func (p blackmagicPhone) open() (console.Camera, error) {
-	return nil, errors.New("the console can't show a Blackmagic camera yet")
+func (p blackmagicPhone) open(name string) (console.Named, error) {
+	cam := blackmagicCamera{blackmagic.NewCamera(p.Address)}
+	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: cam}, nil
+}
+
+// blackmagicCamera is a Blackmagic camera as the console watches it: each
+// watch first makes sure the app is streaming, so MediaMTX has its picture.
+type blackmagicCamera struct{ *blackmagic.Camera }
+
+func (c blackmagicCamera) Watch(ctx context.Context) (<-chan bool, error) {
+	if err := c.EnsureStreaming(ctx); err != nil {
+		slog.Error("livestream", "err", err)
+	}
+	return c.Camera.Watch(ctx)
 }
 
 // settings is the keys of one [[camera]] table. take removes the ones read;

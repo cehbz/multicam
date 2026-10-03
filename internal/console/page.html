@@ -20,7 +20,7 @@ header button::before { content: ""; box-sizing: border-box; width: 20px; height
 /* The tiles share the height under the bar; each picture is fitted whole in its tile. */
 main { flex: 1; min-height: 0; display: flex; flex-direction: column }
 .tile { flex: 1 1 0; min-height: 0; position: relative; display: block; width: 100%; overflow: hidden }
-.tile img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none }
+.tile img, .tile video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none }
 .name { position: absolute; top: 12px; left: 12px; padding: 1px 6px; border-radius: 3px; background: rgba(0, 0, 0, .55); font-size: 12px }
 
 /* The corner mark is what a tap does: a record disc, or a stop square while recording. */
@@ -43,9 +43,10 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column }
 <button id="stop" aria-label="Stop all">all</button>
 </header>
 <main>
-{{range .}}<button class="tile" data-camera="{{.Name}}">
-<img src="/{{.Name}}/liveview" alt="{{.Name}} liveview">
-<span class="name">{{.Name}}</span>
+{{range .Cameras}}<button class="tile" data-camera="{{.Name}}">
+{{if .Stream}}<video autoplay muted playsinline data-whep=":{{$.WHEPPort}}/{{.Stream}}/whep"></video>
+{{else}}<img src="/{{.Name}}/liveview" alt="{{.Name}} liveview">
+{{end}}<span class="name">{{.Name}}</span>
 <span class="mark"></span>
 <span class="error"></span>
 </button>
@@ -56,7 +57,7 @@ const stop = document.getElementById('stop');
 const fault = document.getElementById('fault');
 
 // A tile's state: the camera's last known recording status, the refusal of
-// its last command, the error of its last status read, whether a command is
+// its last command, the error of its watch, whether a command is
 // outstanding, and the clock at its last command's answer.
 const tiles = new Map();
 for (const el of document.querySelectorAll('.tile')) {
@@ -68,11 +69,11 @@ const all = [...tiles.values()];
 start.onclick = () => command('/start', all);
 stop.onclick = () => command('/stop', all);
 
-// clock orders status requests and command answers.
+// clock orders events and command answers.
 let clock = 0;
 
-// draw shows every tile's state. A status is unread when its camera's read
-// failed or the console didn't answer.
+// draw shows every tile's state. A status is unread when its camera's watch
+// failed or the console's events aren't arriving.
 function draw() {
 	const unanswered = fault.textContent !== '';
 	for (const t of all) {
@@ -84,7 +85,7 @@ function draw() {
 	start.disabled = stop.disabled = all.some(t => t.busy);
 }
 
-// read takes a camera's line of a report into its tile.
+// read takes a camera's state into its tile.
 function read(t, s) {
 	if ('recording' in s) {
 		t.recording = s.recording;
@@ -94,13 +95,6 @@ function read(t, s) {
 	}
 }
 
-// ask requests path and answers with its report's cameras.
-async function ask(method, path) {
-	const r = await fetch(path, {method});
-	if (!r.ok) throw new Error(method + ' ' + path + ': ' + r.status);
-	return (await r.json()).cameras;
-}
-
 // command sends the record command at path for the tiles ts, unless one of
 // them has a command outstanding, and shows its report.
 async function command(path, ts) {
@@ -108,9 +102,10 @@ async function command(path, ts) {
 	for (const t of ts) t.busy = true;
 	draw();
 	try {
-		const cameras = await ask('POST', path);
+		const r = await fetch(path, {method: 'POST'});
+		if (!r.ok) throw new Error('POST ' + path + ': ' + r.status);
 		clock++;
-		for (const s of cameras) {
+		for (const s of (await r.json()).cameras) {
 			const t = tiles.get(s.name);
 			t.answered = clock;
 			t.refusal = 'recording' in s && s.error || '';
@@ -124,22 +119,67 @@ async function command(path, ts) {
 	draw();
 }
 
-// watch reads every camera's status, and again 3 s after each answer. A
-// tile whose command answered after the read was requested keeps the
-// command's report.
-async function watch() {
-	const asked = ++clock;
-	try {
-		for (const s of await ask('GET', '/status')) {
-			const t = tiles.get(s.name);
-			if (asked > t.answered) read(t, s);
-		}
-		fault.textContent = '';
-	} catch (e) {
-		fault.textContent = 'console: ' + e.message;
-	}
+// The console pushes every camera's state on connection and then each
+// change. An event is read at its own clock, after any command answered
+// before it, and applies unless a command answered later. The browser
+// reconnects a dropped stream by itself and the states arrive again.
+const events = new EventSource('/events');
+events.onopen = () => {
+	fault.textContent = '';
 	draw();
-	setTimeout(watch, 3000);
+};
+events.onerror = () => {
+	fault.textContent = 'console: events disconnected';
+	draw();
+};
+events.onmessage = e => {
+	const s = JSON.parse(e.data);
+	const t = tiles.get(s.name);
+	if (!t) return;
+	const at = ++clock;
+	if (at > t.answered) read(t, s);
+	draw();
+};
+
+// play shows the stream at the WHEP endpoint url in video: the browser's
+// offer is posted and the answer set. The connection is made again 2 s
+// after it fails or ends.
+function play(video, url) {
+	const pc = new RTCPeerConnection();
+	let over = false;
+	const again = () => {
+		if (over) return;
+		over = true;
+		pc.close();
+		setTimeout(() => play(video, url), 2000);
+	};
+	pc.addTransceiver('video', {direction: 'recvonly'});
+	pc.ontrack = e => { video.srcObject = e.streams[0] || new MediaStream([e.track]); };
+	pc.onconnectionstatechange = () => {
+		if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) again();
+	};
+	(async () => {
+		await pc.setLocalDescription(await pc.createOffer());
+		await gathered(pc);
+		const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/sdp'}, body: pc.localDescription.sdp});
+		if (!r.ok) throw new Error('POST ' + url + ': ' + r.status);
+		await pc.setRemoteDescription({type: 'answer', sdp: await r.text()});
+	})().catch(again);
 }
-watch();
+
+// gathered resolves once pc's ICE candidates are gathered, or after 1 s.
+function gathered(pc) {
+	return new Promise(resolve => {
+		if (pc.iceGatheringState === 'complete') return resolve();
+		const timer = setTimeout(resolve, 1000);
+		pc.onicegatheringstatechange = () => {
+			if (pc.iceGatheringState === 'complete') {
+				clearTimeout(timer);
+				resolve();
+			}
+		};
+	});
+}
+
+for (const v of document.querySelectorAll('video[data-whep]')) play(v, 'http://' + location.hostname + v.dataset.whep);
 </script>

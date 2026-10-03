@@ -1,7 +1,10 @@
 package rig
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cehbz/multicam/internal/console"
 	"github.com/cehbz/multicam/internal/sony"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
@@ -114,17 +118,92 @@ func TestLoadGivesEachCameraItsOwnBody(t *testing.T) {
 	if len(rig.Cameras) != 2 || rig.Cameras[0].Name != "first" || rig.Cameras[1].Name != "second" {
 		t.Fatalf("rig cameras %v, want first and second", rig.Cameras)
 	}
+	if _, ok := rig.Cameras[0].Picture.(console.Relayed); !ok {
+		t.Errorf("a Sony body's picture is %T, want one the console relays", rig.Cameras[0].Picture)
+	}
 	if err := rig.Cameras[1].StartRecording(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rig.Cameras[0].Recording(t.Context()); err != nil {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	if _, err := rig.Cameras[0].Watch(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := first.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
+	if got, want := first.Calls()[:1], []string{"getEvent@1.3"}; !slices.Equal(got, want) {
 		t.Errorf("first camera's calls %v, want %v", got, want)
 	}
 	if got, want := second.Calls(), []string{"startMovieRec@1.0"}; !slices.Equal(got, want) {
 		t.Errorf("second camera's calls %v, want %v", got, want)
+	}
+}
+
+// receive is the next state ch delivers, failing when none comes in a second.
+func receive(t *testing.T, ch <-chan bool) bool {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			t.Fatal("the watch ended")
+		}
+		return v
+	case <-time.After(time.Second):
+		t.Fatal("no state delivered")
+		return false
+	}
+}
+
+func TestSonyBodyIsRecordingWhileItsStatusIsMovieRecording(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	cam, err := sonyBody{Endpoint: fake.Endpoint()}.open("body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ch, err := cam.Watch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := receive(t, ch); got {
+		t.Errorf("IDLE body's state %v, want not recording", got)
+	}
+	for _, c := range []struct {
+		status string
+		want   bool
+	}{{"MovieWaitRecStart", false}, {"MovieRecording", true}, {"MovieWaitRecStop", false}, {"MovieSaving", false}, {"IDLE", false}} {
+		fake.Push(c.status)
+		if got := receive(t, ch); got != c.want {
+			t.Errorf("state on %s %v, want %v", c.status, got, c.want)
+		}
+	}
+	cancel()
+	if _, ok := <-ch; ok {
+		t.Error("the watch delivered after its context ended")
+	}
+}
+
+func TestSonyBodyWatchFailureIsReturned(t *testing.T) {
+	gone := httptest.NewServer(http.NotFoundHandler())
+	gone.Close() // its address now refuses connections
+	cam, err := sonyBody{Endpoint: gone.URL + "/sony/camera"}.open("body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ch, err := cam.Watch(t.Context()); err == nil || !strings.HasPrefix(err.Error(), "getEvent: ") {
+		t.Errorf("Watch = %v, %v; want no channel and the failed status read", ch, err)
+	}
+}
+
+func TestBlackmagicPhoneIsStreamedUnderItsName(t *testing.T) {
+	cam, err := blackmagicPhone{Address: "192.168.1.9:4444"}.open("pixel9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cam.Picture, (console.Streamed{Path: "pixel9"}); got != want {
+		t.Errorf("picture %#v, want %#v", got, want)
+	}
+	if cam.Name != "pixel9" || cam.Camera == nil {
+		t.Errorf("camera %#v, want pixel9 with a camera", cam)
 	}
 }
 
