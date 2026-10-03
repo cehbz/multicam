@@ -52,12 +52,10 @@ func (a adapted[L]) Liveview(ctx context.Context) (Liveview, error) {
 }
 
 // Named is a camera as the console shows it: under its name, which also keys
-// its routes, and with its picture on its side, a quarter turn
-// counter-clockwise, when OnItsSide.
+// its routes.
 type Named struct {
 	Name string
 	Camera
-	OnItsSide bool
 }
 
 // state is one camera's line of a report: whether it is recording, absent

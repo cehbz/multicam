@@ -21,9 +21,6 @@ header button::before { content: ""; box-sizing: border-box; width: 20px; height
 main { flex: 1; min-height: 0; display: flex; flex-direction: column }
 .tile { flex: 1 1 0; min-height: 0; position: relative; display: block; width: 100%; overflow: hidden }
 .tile img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none }
-/* A picture on its side: its box is its tile's with width and height swapped, turned a quarter turn counter-clockwise about the tile's centre. */
-.on-its-side { container-type: size }
-.on-its-side img { inset: auto; top: 50%; left: 50%; width: 100cqh; height: 100cqw; translate: -50% -50%; rotate: -90deg }
 .name { position: absolute; top: 12px; left: 12px; padding: 1px 6px; border-radius: 3px; background: rgba(0, 0, 0, .55); font-size: 12px }
 
 /* The corner mark is what a tap does: a record disc, or a stop square while recording. */
@@ -46,7 +43,7 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column }
 <button id="stop" aria-label="Stop all">all</button>
 </header>
 <main>
-{{range .}}<button class="tile{{if .OnItsSide}} on-its-side{{end}}" data-camera="{{.Name}}">
+{{range .}}<button class="tile" data-camera="{{.Name}}">
 <img src="/{{.Name}}/liveview" alt="{{.Name}} liveview">
 <span class="name">{{.Name}}</span>
 <span class="mark"></span>

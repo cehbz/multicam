@@ -38,52 +38,6 @@ func TestConfigPath(t *testing.T) {
 	}
 }
 
-// The adb commands a Pixel camera sends, after "-s <address>".
-const (
-	pixelStatus  = "shell dumpsys audio | grep 'source client=CAMCORDER' || true"
-	pixelFront   = "shell dumpsys activity activities | grep 'topResumedActivity=.*com.google.android.GoogleCamera/' || true"
-	pixelShutter = "shell input keyevent 24"
-)
-
-var pixelScreen = append([]byte{0xff, 0xd8, 0xff, 0xe0}, "pixel screen"...)
-
-// fakePixel writes an adb stand-in for a Pixel at address with Pixel Camera
-// in front: its screenshot is pixelScreen and its shutter key toggles the
-// recording its status reports. commands lists what the phone was sent.
-func fakePixel(t *testing.T, address string) (adb string, commands func() []string) {
-	dir := t.TempDir()
-	adb = filepath.Join(dir, "adb")
-	script := `#!/bin/sh
-echo "$*" >> '` + dir + `/log'
-case "$*" in
-"connect ` + address + `") echo "already connected to ` + address + `" ;;
-"-s ` + address + ` exec-out screencap -j") printf '\377\330\377\340pixel screen' ;;
-"-s ` + address + ` ` + pixelStatus + `")
-	if [ -e '` + dir + `/recording' ]; then
-		echo "  session:20857 -- source client=CAMCORDER, dev=2ch 48000Hz ENCODING_PCM_16BIT -- uid:10171 -- patch:2329 -- pack:com.google.android.GoogleCamera -- format client=2ch 48000Hz ENCODING_PCM_16BIT, dev=2ch 48000Hz ENCODING_PCM_16BIT"
-	fi ;;
-"-s ` + address + ` ` + pixelFront + `")
-	echo "topResumedActivity=ActivityRecord{142494291 u0 com.google.android.GoogleCamera/com.google.android.apps.camera.activity.main.CameraActivity t53927}" ;;
-"-s ` + address + ` ` + pixelShutter + `")
-	if [ -e '` + dir + `/recording' ]; then rm '` + dir + `/recording'; else touch '` + dir + `/recording'; fi ;;
-*) echo "fake adb: unexpected command: $*" >&2; exit 1 ;;
-esac
-`
-	if err := os.WriteFile(adb, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return adb, func() []string {
-		log, _ := os.ReadFile(filepath.Join(dir, "log"))
-		var sent []string
-		for line := range strings.Lines(string(log)) {
-			if command, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), "-s "+address+" "); ok {
-				sent = append(sent, command)
-			}
-		}
-		return sent
-	}
-}
-
 // firstParts reads the first n parts of the picture at url, then leaves it.
 func firstParts(t *testing.T, url string, n int) [][]byte {
 	t.Helper()
@@ -109,13 +63,11 @@ func firstParts(t *testing.T, url string, n int) [][]byte {
 	return frames
 }
 
-func TestRunServesSonyAndPixelCamerasUntilStopped(t *testing.T) {
-	sonyFake := sonytest.NewCamera(t)
-	const address = "192.168.1.109:41419"
-	adb, pixelCommands := fakePixel(t, address)
+func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
+	sonyFake, second := sonytest.NewCamera(t), sonytest.NewCamera(t)
 	config := filepath.Join(t.TempDir(), "multicam.toml")
-	text := fmt.Sprintf("[adb]\npath = %q\nkey_dir = %q\n[[camera]]\nname = \"one\"\nkind = \"sony\"\nendpoint = %q\n[[camera]]\nname = \"pixel9\"\nkind = \"pixel\"\naddress = %q\n",
-		adb, t.TempDir(), sonyFake.Endpoint(), address)
+	text := fmt.Sprintf("[[camera]]\nname = \"one\"\nkind = \"sony\"\nendpoint = %q\n[[camera]]\nname = \"two\"\nkind = \"sony\"\nendpoint = %q\n",
+		sonyFake.Endpoint(), second.Endpoint())
 	if err := os.WriteFile(config, []byte(text), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -147,40 +99,26 @@ func TestRunServesSonyAndPixelCamerasUntilStopped(t *testing.T) {
 	}
 	page := body(http.Get(base + "/"))
 	last := -1
-	for _, want := range []string{`data-camera="one"`, `<img src="/one/liveview"`, `data-camera="pixel9"`, `<img src="/pixel9/liveview"`} {
+	for _, want := range []string{`data-camera="one"`, `<img src="/one/liveview"`, `data-camera="two"`, `<img src="/two/liveview"`} {
 		i := strings.Index(page, want)
 		if i <= last {
 			t.Errorf("page lacks %s after byte %d: %q", want, last, page)
 		}
 		last = max(last, i)
 	}
-	if got, want := body(http.Get(base+"/status")), `{"cameras":[{"name":"one","recording":false},{"name":"pixel9","recording":false}]}`+"\n"; got != want {
+	if got, want := body(http.Get(base+"/status")), `{"cameras":[{"name":"one","recording":false},{"name":"two","recording":false}]}`+"\n"; got != want {
 		t.Fatalf("status report %q, want %q", got, want)
 	}
 
-	// Start on the Pixel alone.
-	if got, want := body(http.Post(base+"/pixel9/start", "", nil)), `{"cameras":[{"name":"pixel9","recording":true}]}`+"\n"; got != want {
-		t.Errorf("report of the Pixel's start %q, want %q", got, want)
-	}
-	wantPixel := []string{
-		pixelStatus,                                        // the status report
-		pixelStatus,                                        // Start: its status before,
-		pixelStatus, pixelFront, pixelShutter, pixelStatus, // the command,
-		pixelStatus, // and its status after
-	}
-	if got := pixelCommands(); !slices.Equal(got, wantPixel) {
-		t.Errorf("adb commands to the Pixel:\n got %q\nwant %q", got, wantPixel)
+	// Start on the second camera alone.
+	if got, want := body(http.Post(base+"/two/start", "", nil)), `{"cameras":[{"name":"two","recording":true}]}`+"\n"; got != want {
+		t.Errorf("report of the second camera's start %q, want %q", got, want)
 	}
 	if got, want := sonyFake.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
-		t.Errorf("Sony camera's calls after the Pixel's Start %v, want %v", got, want)
+		t.Errorf("first camera's calls after the second's Start %v, want %v", got, want)
 	}
 
 	// Each picture relays its own camera.
-	for i, frame := range firstParts(t, base+"/pixel9/liveview", 2) {
-		if !bytes.Equal(frame, pixelScreen) {
-			t.Errorf("Pixel picture part %d = %q, want its screenshot", i, frame)
-		}
-	}
 	resp, err := http.Get(base + "/one/liveview")
 	if err != nil {
 		t.Fatal(err)
@@ -210,6 +148,6 @@ func TestRunServesSonyAndPixelCamerasUntilStopped(t *testing.T) {
 		t.Fatal("run still serving 5 s after its context ended")
 	}
 	if got, want := sonyFake.Calls(), []string{"getEvent@1.3", "startLiveview@1.0", "stopLiveview@1.0"}; !slices.Equal(got, want) {
-		t.Errorf("Sony camera's calls %v, want %v", got, want)
+		t.Errorf("first camera's calls %v, want %v", got, want)
 	}
 }

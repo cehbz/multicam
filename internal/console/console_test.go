@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"mime"
@@ -15,12 +14,10 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
-	"github.com/cehbz/multicam/internal/pixel"
 	"github.com/cehbz/multicam/internal/sony"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
@@ -287,22 +284,6 @@ func TestPageTilesEveryCameraInOrder(t *testing.T) {
 	}
 }
 
-// tile matches a tile's opening tag: what its class says after "tile", and
-// its camera.
-var tile = regexp.MustCompile(`<button class="tile([^"]*)" data-camera="([^"]+)">`)
-
-func TestPageMarksTheTilesShownOnTheirSide(t *testing.T) {
-	cam := Adapt(&stills{})
-	console := New([]Named{{Name: "level", Camera: cam}, {Name: "phone", Camera: cam, OnItsSide: true}})
-	var got []string
-	for _, m := range tile.FindAllStringSubmatch(get(console, "/").Body.String(), -1) {
-		got = append(got, m[2]+m[1])
-	}
-	if want := []string{"level", "phone on-its-side"}; !slices.Equal(got, want) {
-		t.Errorf("tiles %q, want %q", got, want)
-	}
-}
-
 func TestPageHasTheAllButtonsAndTheScript(t *testing.T) {
 	_, _, console := twoCameras(t)
 	page := get(console, "/").Body.String()
@@ -492,54 +473,17 @@ func TestAdaptedFailedStartHasNoSession(t *testing.T) {
 	}
 }
 
-// fakePixel is a Pixel behind a fake adb runner, with Pixel Camera in front:
-// the shutter key toggles the recording its status reports.
-type fakePixel struct {
-	mu        sync.Mutex
-	recording bool
-	commands  []string // "status", "front" or "shutter"
-}
-
-func (p *fakePixel) run(_ context.Context, args ...string) ([]byte, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	switch command := strings.Join(args, " "); {
-	case strings.HasPrefix(command, "shell dumpsys audio "):
-		p.commands = append(p.commands, "status")
-		if p.recording {
-			return []byte("  session:20857 -- source client=CAMCORDER, dev=2ch 48000Hz ENCODING_PCM_16BIT -- uid:10171 -- patch:2329 -- pack:com.google.android.GoogleCamera -- format client=2ch 48000Hz ENCODING_PCM_16BIT, dev=2ch 48000Hz ENCODING_PCM_16BIT\n"), nil
-		}
-		return nil, nil
-	case strings.HasPrefix(command, "shell dumpsys activity "):
-		p.commands = append(p.commands, "front")
-		return []byte("topResumedActivity=ActivityRecord{142494291 u0 com.google.android.GoogleCamera/com.google.android.apps.camera.activity.main.CameraActivity t53927}\n"), nil
-	case command == "shell input keyevent 24":
-		p.commands = append(p.commands, "shutter")
-		p.recording = !p.recording
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("fake pixel: unexpected adb command %q", command)
-	}
-}
-
-func (p *fakePixel) sent() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return slices.Clone(p.commands)
-}
-
-// mixedRig is the console for three cameras in this order: "front", a Sony
-// body that is recording; "side", a Sony body that is idle; and "phone", an
-// idle Pixel. The Sony fakes' call logs start after the setup.
-func mixedRig(t *testing.T) (front, side *sonytest.Camera, phone *fakePixel, console http.Handler, cameras []Named) {
-	front, side, phone = sonytest.NewCamera(t), sonytest.NewCamera(t), &fakePixel{}
+// mixedRig is the console for two Sony bodies in this order: "front", which
+// is recording, and "side", which is idle. The fakes' call logs start after
+// the setup.
+func mixedRig(t *testing.T) (front, side *sonytest.Camera, console http.Handler, cameras []Named) {
+	front, side = sonytest.NewCamera(t), sonytest.NewCamera(t)
 	cameras = []Named{
 		named(t, "front", front.Endpoint()),
 		named(t, "side", side.Endpoint()),
-		{Name: "phone", Camera: Adapt(pixel.NewCamera(phone.run))},
 	}
 	front.SetCameraStatus("MovieRecording")
-	return front, side, phone, New(cameras), cameras
+	return front, side, New(cameras), cameras
 }
 
 // ask sends method to target and decodes the report it answers with.
@@ -576,17 +520,17 @@ func summary(states []state) string {
 }
 
 func TestStatusReportsEveryCamera(t *testing.T) {
-	front, side, phone, _, cameras := mixedRig(t)
+	front, side, _, cameras := mixedRig(t)
 	gone := httptest.NewServer(http.NotFoundHandler())
 	gone.Close() // its address now refuses connections
 	console := New(append(cameras, named(t, "gone", gone.URL+"/sony/camera")))
 
 	states := ask(t, console, http.MethodGet, "/status")
-	if got, want := summary(states), "front=recording side=idle phone=idle gone=?!"; got != want {
+	if got, want := summary(states), "front=recording side=idle gone=?!"; got != want {
 		t.Fatalf("report %q, want %q", got, want)
 	}
-	if !strings.HasPrefix(states[3].Error, "getEvent: ") {
-		t.Errorf("unreachable camera's error %q, want its failed status read", states[3].Error)
+	if !strings.HasPrefix(states[2].Error, "getEvent: ") {
+		t.Errorf("unreachable camera's error %q, want its failed status read", states[2].Error)
 	}
 	if got, want := front.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
 		t.Errorf("front camera's calls %v, want %v", got, want)
@@ -594,15 +538,12 @@ func TestStatusReportsEveryCamera(t *testing.T) {
 	if got, want := side.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
 		t.Errorf("side camera's calls %v, want %v", got, want)
 	}
-	if got, want := phone.sent(), []string{"status"}; !slices.Equal(got, want) {
-		t.Errorf("phone's commands %v, want %v", got, want)
-	}
 }
 
 func TestStartAllStartsTheIdleCameras(t *testing.T) {
-	front, side, phone, console, _ := mixedRig(t)
+	front, side, console, _ := mixedRig(t)
 
-	if got, want := summary(ask(t, console, http.MethodPost, "/start")), "front=recording side=recording phone=recording"; got != want {
+	if got, want := summary(ask(t, console, http.MethodPost, "/start")), "front=recording side=recording"; got != want {
 		t.Errorf("report %q, want %q", got, want)
 	}
 	if got, want := front.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
@@ -611,21 +552,18 @@ func TestStartAllStartsTheIdleCameras(t *testing.T) {
 	if got, want := side.Calls(), []string{"getEvent@1.3", "startMovieRec@1.0", "getEvent@1.3"}; !slices.Equal(got, want) {
 		t.Errorf("idle Sony camera's calls %v, want %v", got, want)
 	}
-	if got, want := phone.sent(), []string{"status", "status", "front", "shutter", "status", "status"}; !slices.Equal(got, want) {
-		t.Errorf("idle Pixel's commands %v, want %v", got, want)
-	}
 }
 
 func TestStopAllStopsTheRecordingCameras(t *testing.T) {
-	front, side, phone, console, cameras := mixedRig(t)
+	front, side, console, cameras := mixedRig(t)
 	front.SetCameraStatus("")
-	for _, cam := range []Named{cameras[0], cameras[2]} {
+	for _, cam := range []Named{cameras[0]} {
 		if err := cam.StartRecording(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if got, want := summary(ask(t, console, http.MethodPost, "/stop")), "front=idle side=idle phone=idle"; got != want {
+	if got, want := summary(ask(t, console, http.MethodPost, "/stop")), "front=idle side=idle"; got != want {
 		t.Errorf("report %q, want %q", got, want)
 	}
 	if got, want := front.Calls(), []string{"startMovieRec@1.0", "getEvent@1.3", "stopMovieRec@1.0", "getEvent@1.3"}; !slices.Equal(got, want) {
@@ -633,9 +571,6 @@ func TestStopAllStopsTheRecordingCameras(t *testing.T) {
 	}
 	if got, want := side.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
 		t.Errorf("idle camera's calls %v, want only its status read %v", got, want)
-	}
-	if phone.recording {
-		t.Errorf("the Pixel is still recording after %v", phone.sent())
 	}
 }
 

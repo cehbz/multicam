@@ -1,10 +1,4 @@
-# The rig on the Pixel 3 XL.
-
-# The adb client that reaches the Pixel cameras, and the directory it keeps
-# its key in.
-[adb]
-path = "/data/data/com.termux/files/usr/bin/adb"
-key_dir = "/data/local/tmp/mc/adbhome"
+# The rig on the phone.
 
 # Sony bodies, each joined on its own Wi-Fi interface. endpoint is optional
 # and defaults to the bodies' fixed camera service.
@@ -17,10 +11,3 @@ interface = "wlan1"
 name = "rx100m6"
 kind = "sony"
 interface = "cam2"
-
-# address is the phone's wireless debugging address; its port changes when
-# wireless debugging restarts.
-[[camera]]
-name = "pixel9"
-kind = "pixel"
-address = "192.168.1.109:41419"

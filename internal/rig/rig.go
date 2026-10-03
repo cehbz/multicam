@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"net"
 	"os"
 	"regexp"
 	"slices"
@@ -14,7 +13,6 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/cehbz/multicam/internal/console"
-	"github.com/cehbz/multicam/internal/pixel"
 	"github.com/cehbz/multicam/internal/sony"
 )
 
@@ -24,8 +22,7 @@ type Rig struct {
 	Cameras []console.Named
 }
 
-// Load reads the rig from the TOML config file at path. A Pixel's picture is
-// shown on its side: its screenshots are portrait while it films on its side.
+// Load reads the rig from the TOML config file at path.
 func Load(path string) (*Rig, error) {
 	text, err := os.ReadFile(path)
 	if err != nil {
@@ -41,8 +38,7 @@ func Load(path string) (*Rig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: camera %s: %w", path, c.Name, err)
 		}
-		_, phone := c.Kind.(pixelPhone)
-		rig.Cameras = append(rig.Cameras, console.Named{Name: c.Name, Camera: cam, OnItsSide: phone})
+		rig.Cameras = append(rig.Cameras, console.Named{Name: c.Name, Camera: cam})
 	}
 	return rig, nil
 }
@@ -75,24 +71,6 @@ func (b sonyBody) open() (console.Camera, error) {
 	return console.Adapt(cam), nil
 }
 
-// pixelPhone is a Pixel (kind "pixel"): the address of its wireless
-// debugging, and the adb client that reaches it.
-type pixelPhone struct {
-	Address string
-	adb     adbClient
-}
-
-func (p pixelPhone) open() (console.Camera, error) {
-	return console.Adapt(pixel.NewCamera(pixel.ADB(p.adb.Path, p.adb.KeyDir, p.Address))), nil
-}
-
-// adbClient is the config's [adb] table: the adb binary and the directory it
-// keeps its key in.
-type adbClient struct {
-	Path   string `toml:"path"`
-	KeyDir string `toml:"key_dir"`
-}
-
 // settings is the keys of one [[camera]] table. take removes the ones read;
 // the ones left are unknown to the camera's kind.
 type settings struct {
@@ -118,7 +96,6 @@ var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 // unique valid name and the settings of its kind.
 func parse(text string) ([]camera, error) {
 	var config struct {
-		ADB     adbClient        `toml:"adb"`
 		Cameras []map[string]any `toml:"camera"`
 	}
 	md, err := toml.Decode(text, &config)
@@ -153,18 +130,10 @@ func parse(text string) ([]camera, error) {
 				body.Endpoint = sony.DefaultEndpoint
 			}
 			c.Kind = body
-		case "pixel":
-			phone := pixelPhone{Address: s.take("address"), adb: config.ADB}
-			if _, _, err := net.SplitHostPort(phone.Address); err != nil {
-				kindErr = fmt.Errorf("address %q is not the phone's wireless debugging address and port", phone.Address)
-			} else if phone.adb.Path == "" || phone.adb.KeyDir == "" {
-				kindErr = errors.New("a Pixel needs [adb] path and key_dir")
-			}
-			c.Kind = phone
 		case "":
-			kindErr = errors.New(`no kind: add kind = "sony" or kind = "pixel"`)
+			kindErr = errors.New(`no kind: add kind = "sony"`)
 		default:
-			kindErr = fmt.Errorf(`kind %q is not "sony" or "pixel"`, kindName)
+			kindErr = fmt.Errorf(`kind %q is not "sony"`, kindName)
 		}
 		if kindErr == nil {
 			kindErr = s.err
