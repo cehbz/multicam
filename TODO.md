@@ -3,6 +3,10 @@
 Design and findings: KB node `projects/multicam.md`.
 
 ## Stories, in order
+0. Cold-start run of the rig: the Pixel 3 XL rebooted and unlocked once, the
+   Sony bodies off, the Pixel 9 locked with Blackmagic Camera closed. Not yet
+   seen on the phone: a result popping up as a banner, and Start rig reusing
+   the console's tab.
 1. Keep the Pixel 3 XL awake while it is on power and the console page is
    being viewed: when its screen sleeps, the page's pictures freeze until it
    is reloaded.
@@ -30,8 +34,6 @@ Regroup after these. Candidates:
   find out whether the Sony bodies can be made to use a set Wi-Fi channel.
   Measured with both connected: 24.8 and 24.7 fps when both were on
   channel 1, 6.4 and 10.5 fps on channels 1 and 11.
-- Rejoin a camera's link when the camera wakes; today `rig.sh start` or
-  `scripts/phone-links.sh` is rerun by hand.
 - Stream quality for the Pixel 9's picture: the SRT platform's bitrate and
   size are set by hand on the phone; a test target of 720p30 H.264 at
   2.5 Mbit/s was agreed and not run.
