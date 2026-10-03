@@ -24,14 +24,10 @@ MEDIAMTX=$D/mtx/mediamtx
 CONSOLE=http://localhost:8080/
 SETSID=$(command -v setsid)
 
-# Pids of the processes running exe, by /proc: a binary pushed over a running
-# one reads as deleted.
+# Pids of the processes running exe, by name: a binary pushed over a running
+# one keeps its name, and a scan of /proc/*/exe takes 15 s on this phone.
 pids() {
-	for p in /proc/[0-9]*; do
-		case "$(readlink "$p/exe" 2>/dev/null)" in
-		"$1" | "$1 (deleted)") echo "${p#/proc/}" ;;
-		esac
-	done
+	pidof "${1##*/}"
 }
 
 # Starts exe in dir with the remaining arguments unless it runs already,
