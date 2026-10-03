@@ -18,27 +18,40 @@ import (
 // Camera simulates a legacy-API body: the rec-mode API list appears only
 // after startRecMode and a NotReady interval, startMovieRec only in movie mode.
 // Its liveview stream repeats Frames in order until the client disconnects,
-// each JPEG packet followed by a frame-info packet.
+// each JPEG packet followed by a frame-info packet. A long-polling getEvent
+// blocks until an answer is scripted with Push or PushError, or the client
+// goes away.
 type Camera struct {
 	// Frames are the liveview JPEG images: three distinct 64x48 images.
 	Frames [][]byte
 
-	t          *testing.T
-	srv        *httptest.Server
-	mu         sync.Mutex
-	recMode    bool
-	readyPolls int
-	shootMode  string
-	recording  bool
-	zoom       int
-	calls      []string
-	failures   map[string][]any
-	status     string
+	t            *testing.T
+	srv          *httptest.Server
+	mu           sync.Mutex
+	recMode      bool
+	readyPolls   int
+	shootMode    string
+	recording    bool
+	zoom         int
+	calls        []string
+	failures     map[string][]any
+	status       string
+	events       []event
+	wake         chan struct{} // closed when an event is pushed
+	busy         map[string]time.Duration
+	inFlight     int
+	mostInFlight int
+}
+
+// event is one scripted long-poll answer.
+type event struct {
+	status string // the cameraStatus, or none when empty
+	err    []any  // a camera error in place of a result
 }
 
 // NewCamera starts a fake camera that is shut down when the test ends.
 func NewCamera(t *testing.T) *Camera {
-	c := &Camera{t: t, shootMode: "still", failures: map[string][]any{}}
+	c := &Camera{t: t, shootMode: "still", failures: map[string][]any{}, wake: make(chan struct{}), busy: map[string]time.Duration{}}
 	for _, shade := range []byte{0, 128, 255} {
 		img := image.NewGray(image.Rect(0, 0, 64, 48))
 		for i := range img.Pix {
@@ -61,7 +74,8 @@ func NewCamera(t *testing.T) *Camera {
 // Endpoint is the camera service URL.
 func (c *Camera) Endpoint() string { return c.srv.URL + "/sony/camera" }
 
-// Calls lists the RPCs received so far, in order, as "method@version".
+// Calls lists the RPCs received so far, in order, as "method@version", with
+// a "+" after a long-polling getEvent.
 func (c *Camera) Calls() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -80,6 +94,37 @@ func (c *Camera) SetCameraStatus(status string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.status = status
+}
+
+// Push scripts the next long-polling getEvent's answer: status as the
+// cameraStatus, which later reads also report, or with an empty status an
+// answer without a cameraStatus element.
+func (c *Camera) Push(status string) { c.push(event{status: status}) }
+
+// PushError scripts the next long-polling getEvent to answer with a camera
+// error.
+func (c *Camera) PushError(code int, message string) { c.push(event{err: []any{code, message}}) }
+
+func (c *Camera) push(e event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+	close(c.wake)
+	c.wake = make(chan struct{})
+}
+
+// Busy makes method take d to answer. MostInFlight counts busy calls.
+func (c *Camera) Busy(method string, d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.busy[method] = d
+}
+
+// MostInFlight is the most busy calls that were in flight at once.
+func (c *Camera) MostInFlight() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mostInFlight
 }
 
 func (c *Camera) apis() []string {
@@ -107,9 +152,28 @@ func (c *Camera) rpc(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.calls = append(c.calls, req.Method+"@"+req.Version)
+	call := req.Method + "@" + req.Version
+	longPolling := false
+	if req.Method == "getEvent" {
+		if len(req.Params) != 1 {
+			c.t.Errorf("getEvent params %v, want [bool]", req.Params)
+		} else if lp, ok := req.Params[0].(bool); !ok {
+			c.t.Errorf("getEvent params %v, want [bool]", req.Params)
+		} else if longPolling = lp; lp {
+			call += "+"
+		}
+	}
+	c.calls = append(c.calls, call)
 	reply := func(key string, v any) {
 		json.NewEncoder(w).Encode(map[string]any{key: v, "id": req.ID})
+	}
+	if d := c.busy[req.Method]; d > 0 {
+		c.inFlight++
+		c.mostInFlight = max(c.mostInFlight, c.inFlight)
+		c.mu.Unlock()
+		time.Sleep(d)
+		c.mu.Lock()
+		c.inFlight--
 	}
 	if e, ok := c.failures[req.Method]; ok {
 		reply("error", e)
@@ -136,8 +200,29 @@ func (c *Camera) rpc(w http.ResponseWriter, r *http.Request) {
 		}
 		reply("result", []any{c.apis()})
 	case "getEvent":
-		if len(req.Params) != 1 || req.Params[0] != false {
-			c.t.Errorf("getEvent params %v, want [false]", req.Params)
+		if longPolling {
+			for len(c.events) == 0 {
+				wake := c.wake
+				c.mu.Unlock()
+				select {
+				case <-wake:
+				case <-r.Context().Done():
+					c.mu.Lock()
+					return
+				}
+				c.mu.Lock()
+			}
+			e := c.events[0]
+			c.events = c.events[1:]
+			if e.err != nil {
+				reply("error", e.err)
+				return
+			}
+			if e.status == "" {
+				reply("result", []any{map[string]any{"type": "zoomInformation", "zoomPosition": c.zoom}})
+				return
+			}
+			c.status = e.status
 		}
 		status := "IDLE"
 		switch {

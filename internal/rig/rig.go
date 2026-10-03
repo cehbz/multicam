@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -57,11 +58,13 @@ type kind interface {
 }
 
 // sonyBody is a Sony body (kind "sony"): the network interface it is reached
-// on (empty: the system's route) and its camera service endpoint
-// (sony.DefaultEndpoint when left out).
+// on (empty: the system's route), its camera service endpoint
+// (sony.DefaultEndpoint when left out) and the gap a start keeps after the
+// body reports IDLE (start_gap, a duration; none when left out).
 type sonyBody struct {
 	Interface string
 	Endpoint  string
+	StartGap  time.Duration
 }
 
 func (b sonyBody) open() (console.Camera, error) {
@@ -69,6 +72,7 @@ func (b sonyBody) open() (console.Camera, error) {
 	if err != nil {
 		return nil, err
 	}
+	cam.StartGap = b.StartGap
 	return console.Adapt(cam), nil
 }
 
@@ -140,6 +144,13 @@ func parse(text string) ([]camera, error) {
 			body := sonyBody{Interface: s.take("interface"), Endpoint: s.take("endpoint")}
 			if body.Endpoint == "" {
 				body.Endpoint = sony.DefaultEndpoint
+			}
+			if gap := s.take("start_gap"); gap != "" {
+				d, err := time.ParseDuration(gap)
+				if err != nil {
+					kindErr = fmt.Errorf("start_gap %q is not a duration", gap)
+				}
+				body.StartGap = d
 			}
 			c.Kind = body
 		case "blackmagic":

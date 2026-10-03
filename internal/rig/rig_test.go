@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cehbz/multicam/internal/sony"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
@@ -22,13 +23,13 @@ func TestParse(t *testing.T) {
 	}{
 		{
 			name: "two Sony bodies on their interfaces",
-			text: "[[camera]]\nname = \"rx10m4\"\nkind = \"sony\"\ninterface = \"wlan1\"\n[[camera]]\nname = \"rx100m6\"\nkind = \"sony\"\ninterface = \"cam2\"\n",
-			want: []camera{{"rx10m4", sonyBody{"wlan1", sony.DefaultEndpoint}}, {"rx100m6", sonyBody{"cam2", sony.DefaultEndpoint}}},
+			text: "[[camera]]\nname = \"rx10m4\"\nkind = \"sony\"\ninterface = \"wlan1\"\n[[camera]]\nname = \"rx100m6\"\nkind = \"sony\"\ninterface = \"cam2\"\nstart_gap = \"3s\"\n",
+			want: []camera{{"rx10m4", sonyBody{"wlan1", sony.DefaultEndpoint, 0}}, {"rx100m6", sonyBody{"cam2", sony.DefaultEndpoint, 3 * time.Second}}},
 		},
 		{
 			name: "Sony body with an endpoint and no interface",
 			text: "[[camera]]\nname = \"fake-1\"\nkind = \"sony\"\nendpoint = \"http://127.0.0.1:9/sony/camera\"\n",
-			want: []camera{{"fake-1", sonyBody{"", "http://127.0.0.1:9/sony/camera"}}},
+			want: []camera{{"fake-1", sonyBody{"", "http://127.0.0.1:9/sony/camera", 0}}},
 		},
 		{
 			name: "Blackmagic camera at its address",
@@ -36,6 +37,7 @@ func TestParse(t *testing.T) {
 			want: []camera{{"pixel9", blackmagicPhone{"192.168.1.9:4444"}}},
 		},
 		{name: "Blackmagic camera without an address", text: "[[camera]]\nname = \"a\"\nkind = \"blackmagic\"\n", wantErr: `camera 1 (a): address "" is not the phone's HTTP server address and port`},
+		{name: "start gap that is not a duration", text: "[[camera]]\nname = \"a\"\nkind = \"sony\"\nstart_gap = \"soon\"\n", wantErr: `camera 1 (a): start_gap "soon" is not a duration`},
 		{name: "no cameras", text: "", wantErr: "no cameras"},
 		{name: "camera without a name", text: "[[camera]]\nkind = \"sony\"\n", wantErr: "camera 1"},
 		{name: "empty name", text: "[[camera]]\nname = \"\"\nkind = \"sony\"\n", wantErr: "camera 1"},
@@ -89,8 +91,8 @@ func TestPhoneConfig(t *testing.T) {
 	}
 	got, err := parse(string(text))
 	want := []camera{
-		{"rx10m4", sonyBody{"wlan1", sony.DefaultEndpoint}},
-		{"rx100m6", sonyBody{"cam2", sony.DefaultEndpoint}},
+		{"rx10m4", sonyBody{"wlan1", sony.DefaultEndpoint, 0}},
+		{"rx100m6", sonyBody{"cam2", sony.DefaultEndpoint, 3 * time.Second}},
 	}
 	if err != nil || !slices.Equal(got, want) {
 		t.Errorf("parse = %v, %v; want %v", got, err, want)

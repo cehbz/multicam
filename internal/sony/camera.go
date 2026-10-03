@@ -2,11 +2,13 @@ package sony
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -14,11 +16,30 @@ import (
 // DefaultEndpoint is the camera service URL of the RX10M4 and RX100M6.
 const DefaultEndpoint = "http://192.168.122.1:10000/sony/camera"
 
+// Status is a camera's cameraStatus: IDLE, MovieWaitRecStart, MovieRecording,
+// MovieWaitRecStop, MovieSaving, NotReady and so on.
+type Status string
+
+// StatusIdle is the status a body returns to after a stop, and the only one
+// that accepts a start.
+const StatusIdle Status = "IDLE"
+
 // Camera is one body, reached at its camera service endpoint. Its connections
 // are its own, since both bodies answer at the same address.
 type Camera struct {
+	// StartGap is how long after the camera's return to IDLE a start may be
+	// sent (the RX100M6 ignores a start within 3 s of it). Zero sends at once.
+	StartGap time.Duration
+
 	rpc    *Client
+	events *Client      // Watch's long polls, held by the camera up to 120 s
 	stream *http.Client // liveview streams: no time limit
+
+	cmd sync.Mutex // held while a command is in flight
+
+	mu       sync.Mutex
+	watching bool
+	idleAt   time.Time // last transition to IDLE seen by Watch; zero if none
 }
 
 // NewCamera returns the camera whose camera service is at endpoint, with its
@@ -44,17 +65,152 @@ func NewCamera(endpoint, iface string) (*Camera, error) {
 	transport := &http.Transport{DialContext: dialer.DialContext}
 	rpc := NewClient(endpoint)
 	rpc.HTTP.Transport = transport
-	return &Camera{rpc: rpc, stream: &http.Client{Transport: transport}}, nil
+	events := NewClient(endpoint)
+	events.HTTP = &http.Client{Transport: transport, Timeout: 120 * time.Second}
+	return &Camera{rpc: rpc, events: events, stream: &http.Client{Transport: transport}}, nil
 }
 
-// StartRecording starts movie recording. A refusal is the camera's *Error.
+// StartRecording starts movie recording once StartGap has passed since the
+// camera's last return to IDLE. Without Watch running it polls the status
+// every 100 ms, up to 15 s, until IDLE and times the gap from that read. A
+// refusal is the camera's *Error.
 func (c *Camera) StartRecording(ctx context.Context) error {
+	c.cmd.Lock()
+	defer c.cmd.Unlock()
+	if err := c.awaitStartGap(ctx); err != nil {
+		return fmt.Errorf("startMovieRec: %w", err)
+	}
 	return c.call(ctx, "startMovieRec")
 }
 
 // StopRecording stops movie recording. A refusal is the camera's *Error.
 func (c *Camera) StopRecording(ctx context.Context) error {
+	c.cmd.Lock()
+	defer c.cmd.Unlock()
 	return c.call(ctx, "stopMovieRec")
+}
+
+func (c *Camera) awaitStartGap(ctx context.Context) error {
+	if c.StartGap <= 0 {
+		return nil
+	}
+	c.mu.Lock()
+	watching, idleAt := c.watching, c.idleAt
+	c.mu.Unlock()
+	if !watching {
+		var err error
+		if idleAt, err = c.awaitIdle(ctx); err != nil {
+			return err
+		}
+	}
+	if idleAt.IsZero() {
+		return nil
+	}
+	return sleepUntil(ctx, idleAt.Add(c.StartGap))
+}
+
+// awaitIdle polls the status until IDLE and returns when it first read it.
+func (c *Camera) awaitIdle(ctx context.Context) (time.Time, error) {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		s, err := c.status(ctx, false)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if s == StatusIdle {
+			return time.Now(), nil
+		}
+		if time.Now().After(deadline) {
+			return time.Time{}, fmt.Errorf("camera status %s, not IDLE after 15 s", s)
+		}
+		if err := sleepUntil(ctx, time.Now().Add(100*time.Millisecond)); err != nil {
+			return time.Time{}, err
+		}
+	}
+}
+
+func sleepUntil(ctx context.Context, t time.Time) error {
+	d := time.Until(t)
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Watch delivers the camera's status, the current one first and then each
+// change, until ctx ends and the channel closes. It holds one long poll on
+// its own connection; a poll the camera ends unchanged (Timeout) or that
+// fails is repeated, after a second on failure. One Watch per camera: the
+// camera allows one long poll at a time.
+func (c *Camera) Watch(ctx context.Context) (<-chan Status, error) {
+	cur, err := c.status(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan Status, 1)
+	ch <- cur
+	c.mu.Lock()
+	c.watching = true
+	c.mu.Unlock()
+	go func() {
+		defer close(ch)
+		defer func() {
+			c.mu.Lock()
+			c.watching = false
+			c.mu.Unlock()
+		}()
+		for ctx.Err() == nil {
+			s, err := c.status(ctx, true)
+			var camErr *Error
+			switch {
+			case ctx.Err() != nil:
+				return
+			case errors.As(err, &camErr) && camErr.Code == 2:
+				continue
+			case err != nil:
+				sleepUntil(ctx, time.Now().Add(time.Second))
+				continue
+			case s == "" || s == cur:
+				continue
+			}
+			if s == StatusIdle {
+				c.mu.Lock()
+				c.idleAt = time.Now()
+				c.mu.Unlock()
+			}
+			cur = s
+			select {
+			case ch <- s:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// status is one getEvent's cameraStatus, empty when the answer has none.
+func (c *Camera) status(ctx context.Context, longPolling bool) (Status, error) {
+	client := c.rpc
+	if longPolling {
+		client = c.events
+	}
+	ex, err := client.Call(ctx, "getEvent", "1.3", longPolling)
+	if err != nil {
+		return "", fmt.Errorf("getEvent: %w", err)
+	}
+	ev, err := ex.Decoded.Event()
+	if err != nil {
+		return "", err
+	}
+	return Status(ev.CameraStatus), nil
 }
 
 func (c *Camera) call(ctx context.Context, method string) error {
@@ -69,15 +225,11 @@ func (c *Camera) call(ctx context.Context, method string) error {
 // MovieWaitRecStart, which leads to it. MovieWaitRecStop and MovieSaving,
 // which follow a stop, are not recording.
 func (c *Camera) Recording(ctx context.Context) (bool, error) {
-	ex, err := c.rpc.Call(ctx, "getEvent", "1.3", false)
-	if err != nil {
-		return false, fmt.Errorf("getEvent: %w", err)
-	}
-	ev, err := ex.Decoded.Event()
+	s, err := c.status(ctx, false)
 	if err != nil {
 		return false, err
 	}
-	return ev.CameraStatus == "MovieRecording" || ev.CameraStatus == "MovieWaitRecStart", nil
+	return s == "MovieRecording" || s == "MovieWaitRecStart", nil
 }
 
 // Liveview is a running liveview session: the camera's stream of JPEG frames,

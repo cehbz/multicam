@@ -338,3 +338,207 @@ func TestCameraOnAnInterfaceNeedsLinux(t *testing.T) {
 		t.Errorf("NewCamera = %v, %v; want an error naming wlan1 and %s", cam, err, runtime.GOOS)
 	}
 }
+
+// receive returns the next status from ch, failing the test if none arrives.
+func receive(t *testing.T, ch <-chan Status) Status {
+	t.Helper()
+	select {
+	case s, ok := <-ch:
+		if !ok {
+			t.Fatal("status channel closed")
+		}
+		return s
+	case <-time.After(2 * time.Second):
+		t.Fatal("no status within 2 s")
+	}
+	return ""
+}
+
+// silent fails the test if ch delivers anything within d.
+func silent(t *testing.T, ch <-chan Status, d time.Duration) {
+	t.Helper()
+	select {
+	case s, ok := <-ch:
+		t.Fatalf("got %q, %v; want nothing", s, ok)
+	case <-time.After(d):
+	}
+}
+
+func TestWatchDeliversTheInitialStatusThenEachChange(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.SetCameraStatus("IDLE")
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := receive(t, ch); got != "IDLE" {
+		t.Fatalf("initial status %q, want IDLE", got)
+	}
+	silent(t, ch, 50*time.Millisecond)
+	fake.Push("MovieWaitRecStart")
+	if got := receive(t, ch); got != "MovieWaitRecStart" {
+		t.Fatalf("status %q, want MovieWaitRecStart", got)
+	}
+	// Answers for other elements carry no cameraStatus; an unchanged status
+	// is not a change.
+	fake.Push("")
+	fake.Push("MovieWaitRecStart")
+	fake.Push("MovieRecording")
+	if got := receive(t, ch); got != "MovieRecording" {
+		t.Fatalf("status %q, want MovieRecording", got)
+	}
+	silent(t, ch, 50*time.Millisecond)
+	if got := fake.Calls(); len(got) < 5 || got[0] != "getEvent@1.3" || got[1] != "getEvent@1.3+" {
+		t.Errorf("camera calls %v, want a plain getEvent then long polls", got)
+	}
+}
+
+func TestWatchPollsAgainAfterTheCameraTimesOutAPoll(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive(t, ch)
+	fake.PushError(2, "Timeout")
+	fake.Push("MovieRecording")
+	if got := receive(t, ch); got != "MovieRecording" {
+		t.Fatalf("status %q, want MovieRecording", got)
+	}
+}
+
+func TestWatchClosesWhenTheContextEnds(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	ch, err := newCamera(t, fake).Watch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive(t, ch)
+	cancel()
+	select {
+	case s, ok := <-ch:
+		if ok {
+			t.Fatalf("got %q after cancel, want the channel closed", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("channel not closed within 2 s of cancel")
+	}
+}
+
+func TestWatchInitialReadFailureIsReturned(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.Fail("getEvent", 40401, "Camera Not Ready")
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	var camErr *Error
+	if !errors.As(err, &camErr) || camErr.Code != 40401 || ch != nil {
+		t.Errorf("Watch = %v, %v; want no channel and camera error 40401", ch, err)
+	}
+}
+
+func TestStartRecordingWaitsStartGapAfterAnIdleTransition(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	cam := newCamera(t, fake)
+	cam.StartGap = 100 * time.Millisecond
+	ch, err := cam.Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive(t, ch)
+	fake.Push("MovieRecording")
+	receive(t, ch)
+	before := time.Now()
+	fake.Push("IDLE")
+	receive(t, ch)
+	if err := cam.StartRecording(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := time.Since(before); got < cam.StartGap {
+		t.Errorf("startMovieRec sent %v after the IDLE transition, want at least %v", got, cam.StartGap)
+	}
+	// A second start a gap later doesn't wait again.
+	start := time.Now()
+	if err := cam.StartRecording(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := time.Since(start); got > cam.StartGap/2 {
+		t.Errorf("second start took %v, want no wait", got)
+	}
+}
+
+func TestStartRecordingWithoutAnIdleTransitionDoesNotWait(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	cam := newCamera(t, fake)
+	cam.StartGap = time.Second
+	ch, err := cam.Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive(t, ch)
+	start := time.Now()
+	if err := cam.StartRecording(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := time.Since(start); got > cam.StartGap/2 {
+		t.Errorf("StartRecording took %v, want no wait", got)
+	}
+}
+
+func TestStartRecordingWithoutWatchPollsUntilIdleThenWaitsTheGap(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.SetCameraStatus("MovieSaving")
+	cam := newCamera(t, fake)
+	cam.StartGap = 100 * time.Millisecond
+	idle := make(chan time.Time, 1)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		fake.SetCameraStatus("IDLE")
+		idle <- time.Now()
+	}()
+	if err := cam.StartRecording(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// SetCameraStatus is before the time is taken, so a read can see IDLE
+	// just before idleAt; the poll interval bounds the error.
+	if got := time.Since(<-idle); got < cam.StartGap-100*time.Millisecond {
+		t.Errorf("startMovieRec sent %v after IDLE, want about %v", got, cam.StartGap)
+	}
+	calls := fake.Calls()
+	i := slices.Index(calls, "startMovieRec@1.0")
+	if i < 2 || slices.ContainsFunc(calls[:i], func(c string) bool { return c != "getEvent@1.3" }) {
+		t.Errorf("camera calls %v, want repeated plain getEvent before startMovieRec", calls)
+	}
+}
+
+func TestStartRecordingWithoutWatchCancels(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.SetCameraStatus("MovieSaving")
+	cam := newCamera(t, fake)
+	cam.StartGap = time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	err := cam.StartRecording(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if slices.Contains(fake.Calls(), "startMovieRec@1.0") {
+		t.Error("startMovieRec sent while the camera was not idle")
+	}
+}
+
+func TestCommandsAreSentOneAtATime(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.Busy("startMovieRec", 30*time.Millisecond)
+	fake.Busy("stopMovieRec", 30*time.Millisecond)
+	cam := newCamera(t, fake)
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(2)
+		go func() { defer wg.Done(); cam.StartRecording(t.Context()) }()
+		go func() { defer wg.Done(); cam.StopRecording(t.Context()) }()
+	}
+	wg.Wait()
+	if got := fake.MostInFlight(); got != 1 {
+		t.Errorf("%d commands in flight at once, want 1", got)
+	}
+}

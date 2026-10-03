@@ -1,7 +1,9 @@
 # The rig on the phone.
 
 # Sony bodies, each joined on its own Wi-Fi interface. endpoint is optional
-# and defaults to the bodies' fixed camera service.
+# and defaults to the bodies' fixed camera service. start_gap is how long a
+# start waits after the body reports IDLE: the RX100M6 refuses one sooner
+# than 3 s after a stop.
 [[camera]]
 name = "rx10m4"
 kind = "sony"
@@ -11,3 +13,4 @@ interface = "wlan1"
 name = "rx100m6"
 kind = "sony"
 interface = "cam2"
+start_gap = "3s"
