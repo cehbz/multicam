@@ -234,3 +234,32 @@ func TestStopWithNothingRunningSaysSo(t *testing.T) {
 		}
 	}
 }
+
+func TestStartBringsTheDaemonsUpBeforeTheLinks(t *testing.T) {
+	r := newRigDir(t)
+	out, err := os.Create(r.path("start.out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	start := r.cmd("start")
+	start.Stdout, start.Stderr = out, out
+	if err := start.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { start.Process.Kill() })
+	for deadline := time.Now().Add(10 * time.Second); len(r.runs()) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("the start never reached links.sh")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(r.path("start.out"))
+	for _, daemon := range []string{"mediamtx:", "multicam:"} {
+		if !strings.Contains(string(b), daemon) {
+			t.Errorf("links.sh ran before %s was reported (output %q)", daemon, b)
+		}
+	}
+	r.release()
+	start.Wait()
+}

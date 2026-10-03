@@ -3,8 +3,8 @@
 # detached from the shell that starts it so it outlives an adb session or a
 # Termux:Widget tap.
 # Usage: rig.sh start | stop [links] | restart | status
-#   start    joins the cameras (links.sh), then starts MediaMTX and multicam
-#            unless they run already; logs in mediamtx.log and multicam.log
+#   start    starts MediaMTX and multicam unless they run already, then joins
+#            the cameras (links.sh); logs in mediamtx.log and multicam.log
 #            here, pids in *.pid. Fails if a camera is not joined or a daemon
 #            did not start, and is refused while a start or a stop runs.
 #   stop     ends a running start, then stops multicam, then MediaMTX (TERM,
@@ -190,11 +190,11 @@ start() {
 	start_refused && return 1
 	claim
 	rc=0
-	sh "$D/links.sh" || rc=1
-	links_status >/dev/null || rc=1
 	start_daemon mediamtx "$MEDIAMTX" "$D/mtx" || rc=1
 	start_daemon multicam "$MULTICAM" "$D" "$D/multicam.toml" || rc=1
 	echo "console: $CONSOLE"
+	sh "$D/links.sh" || rc=1
+	links_status >/dev/null || rc=1
 	release
 	return $rc
 }
