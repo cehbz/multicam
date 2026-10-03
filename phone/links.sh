@@ -8,6 +8,7 @@ BB=/data/adb/magisk/busybox
 D=$(cd "$(dirname "$0")" && pwd)
 CONF=${1:-$D/links.conf}
 CAMERA=192.168.122.1
+SETSID=$(command -v setsid)
 
 cameras() { grep -v -E '^[[:space:]]*(#|$)' "$CONF"; }
 cli() {
@@ -48,7 +49,9 @@ network={
 	disabled=2
 }
 CONF
-		nohup $BIN/wpa_supplicant -Dnl80211 -i"$IF" -c "$D/$IF.conf" >"$D/$IF.log" 2>&1 </dev/null &
+		# Detached, as rig.sh starts its daemons: a stop that ends a running
+		# start leaves the links up.
+		($SETSID nohup $BIN/wpa_supplicant -Dnl80211 -i"$IF" -c "$D/$IF.conf" >"$D/$IF.log" 2>&1 </dev/null &) >/dev/null 2>&1 </dev/null
 		i=0
 		while [ -z "$(state "$IF")" ] && [ $i -lt 5 ]; do sleep 1; i=$((i + 1)); done
 	fi
