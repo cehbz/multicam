@@ -3,10 +3,9 @@
 Design and findings: KB node `projects/multicam.md`.
 
 ## Stories, in order
-1. Keep the Pixel 3 XL awake while it is on power and the console is in
-   use: when its screen sleeps, the page's pictures freeze until it is
-   reloaded. Open: whether "in use" means the server running or the page
-   being viewed.
+1. Keep the Pixel 3 XL awake while it is on power and the console page is
+   being viewed: when its screen sleeps, the page's pictures freeze until it
+   is reloaded.
 2. Clip-end restart: a Sony body whose status goes from `MovieRecording`
    to `IDLE` without a stop from the console is started again, after its
    gap. Sony stops a clip at about 29 minutes.
