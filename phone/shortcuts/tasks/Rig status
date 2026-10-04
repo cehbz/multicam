@@ -1,7 +1,0 @@
-#!/system/bin/sh
-# Termux:Widget task: notify.sh status as root, which shows rig.sh's result in
-# a notification. Lives in ~/.shortcuts/tasks of Termux's home, pushed there
-# by scripts/phone-run.sh. Termux's PATH has no su; Magisk keeps it on the
-# system path.
-PATH=$PATH:/product/bin:/system/bin:/debug_ramdisk:/sbin
-exec su -c '/data/local/tmp/mc/notify.sh status'

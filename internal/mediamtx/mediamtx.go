@@ -86,8 +86,8 @@ func (s *Server) end(p *os.Process, exited <-chan error) {
 	}
 }
 
-// endRunning ends the processes running Path, which a rig.sh start or an
-// earlier server may have left.
+// endRunning ends the processes running Path, which an earlier server may
+// have left.
 func (s *Server) endRunning() {
 	dir := s.procDir
 	if dir == "" {
