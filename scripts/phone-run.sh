@@ -38,6 +38,8 @@ adb push "$bin" "$remote.new" >/dev/null || exit 1
 adb shell "mv $remote.new $remote && chmod 755 $remote" || exit 1
 adb shell "mkdir -p $mc" || exit 1
 adb push "$repo/multicam.phone.toml" "$config" >/dev/null || exit 1
+# The config holds the bodies' passwords; a push keeps an existing file's mode.
+adb shell "chmod 600 $config" || exit 1
 adb push "$repo/phone/multicam.sh" "$mc/multicam.sh" >/dev/null || exit 1
 
 if [[ -d $repo/bin/wifi ]]; then
