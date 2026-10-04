@@ -238,7 +238,7 @@ func srcs(re *regexp.Regexp, page string) []string {
 	return l
 }
 
-var imgSrc = regexp.MustCompile(`<img src="([^"]+)"`)
+var imgSrc = regexp.MustCompile(`<img data-liveview="([^"]+)"`)
 
 // streamPath is the stream route as the page references it.
 func streamPath(t *testing.T, console http.Handler) string {
@@ -247,7 +247,7 @@ func streamPath(t *testing.T, console http.Handler) string {
 	console.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	m := imgSrc.FindStringSubmatch(rec.Body.String())
 	if m == nil {
-		t.Fatalf("page has no <img src>: %q", rec.Body)
+		t.Fatalf("page has no <img data-liveview>: %q", rec.Body)
 	}
 	return m[1]
 }
@@ -429,7 +429,6 @@ func TestCommandLeavesTheViewersLiveviewRunning(t *testing.T) {
 
 var (
 	tileCamera = regexp.MustCompile(`<button class="tile" data-camera="([^"]+)">`)
-	allButton  = regexp.MustCompile(`<button id="[^"]+" aria-label="([^"]+)">`)
 	script     = regexp.MustCompile(`(?s)<script>(.*)</script>`)
 )
 
@@ -450,8 +449,8 @@ func TestPageTilesEveryCameraInOrder(t *testing.T) {
 	// tile begins.
 	last := -1
 	for _, want := range []string{
-		`data-camera="front"`, `src="/front/liveview"`, ">front<", "</button>",
-		`data-camera="side"`, `src="/side/liveview"`, ">side<", "</button>",
+		`data-camera="front"`, `data-liveview="/front/liveview"`, ">front<", "</button>",
+		`data-camera="side"`, `data-liveview="/side/liveview"`, ">side<", "</button>",
 	} {
 		i := strings.Index(page[last+1:], want)
 		if i < 0 {
@@ -461,21 +460,40 @@ func TestPageTilesEveryCameraInOrder(t *testing.T) {
 	}
 }
 
-func TestPageHasTheAllButtonsAndTheScript(t *testing.T) {
+// barControl is a control of the bar: a button by its label, or the dot or
+// the fault text by its id.
+var barControl = regexp.MustCompile(`<button [^>]*aria-label="([^"]+)"|<button id="(connect|disconnect)"|<[a-z]+ id="(dot|fault)"`)
+
+func TestPageBarHasTheMenuTheDotTheAllButtonsAndReload(t *testing.T) {
 	_, _, console := twoCameras(t)
 	page := get(console, "/").Body.String()
-	if got, want := srcs(allButton, page), []string{"Start all", "Stop all"}; !slices.Equal(got, want) {
-		t.Errorf("buttons for every camera %v, want %v", got, want)
+	bar, _, ok := strings.Cut(page, `class="tile"`)
+	if !ok {
+		t.Fatalf("page has no tile: %q", page)
 	}
-	if i, first := strings.Index(page, `aria-label="Stop all"`), strings.Index(page, `class="tile"`); i < 0 || i > first {
-		t.Errorf("the buttons for every camera are not above the tiles: %q", page)
+	_, bar, ok = strings.Cut(bar, "<header>")
+	if !ok {
+		t.Fatalf("the bar is not above the tiles: %q", page)
+	}
+	var got []string
+	for _, m := range barControl.FindAllStringSubmatch(bar, -1) {
+		got = append(got, m[1]+m[2]+m[3])
+	}
+	// The menu holds Connect and Disconnect.
+	want := []string{"Menu", "connect", "disconnect", "dot", "Start all", "fault", "Stop all", "Reload"}
+	if !slices.Equal(got, want) {
+		t.Errorf("bar %v, want %v", got, want)
+	}
+	if !regexp.MustCompile(`<button [^>]*popovertarget="menu"[^>]*aria-label="Menu"`).MatchString(bar) ||
+		!strings.Contains(bar, `<div id="menu" popover>`) {
+		t.Errorf("the menu button does not open the menu: %q", bar)
 	}
 	m := script.FindStringSubmatch(page)
 	if m == nil {
 		t.Fatalf("page has no script: %q", page)
 	}
 	// The script's routes: the events it listens to and the commands it sends.
-	for _, want := range []string{"new EventSource('/events')", "'/start'", "'/stop'"} {
+	for _, want := range []string{"new EventSource('/events')", "addEventListener('connection'", "'/connect'", "'/disconnect'", "'/start'", "'/stop'", "location.reload()"} {
 		if !strings.Contains(m[1], want) {
 			t.Errorf("script lacks %s: %q", want, m[1])
 		}
@@ -485,6 +503,24 @@ func TestPageHasTheAllButtonsAndTheScript(t *testing.T) {
 	}
 	if strings.Contains(page, "<iframe") {
 		t.Errorf("page has a frame: %q", page)
+	}
+}
+
+// The page loads quiescent: shown disconnected, with no picture requested
+// until its camera reports connected.
+func TestPageRequestsNoPictureOnLoad(t *testing.T) {
+	phone, _ := fed("pixel9")
+	body, _ := relayed(t, "body", sonytest.NewCamera(t).Endpoint())
+	console := New(t.Context(), []Named{phone, body}, saved(t, true))
+	page := get(console, "/").Body.String()
+	if !strings.Contains(page, `<body class="off">`) {
+		t.Errorf("page does not load shown disconnected: %q", page)
+	}
+	if m := regexp.MustCompile(`<(img|video) [^>]*\bsrc=`).FindString(page); m != "" {
+		t.Errorf("page requests a picture on load: %s", m)
+	}
+	if strings.Contains(script.FindStringSubmatch(page)[1], "querySelectorAll('video[data-whep]')) play(") {
+		t.Errorf("script plays the streams on load: %q", page)
 	}
 }
 
@@ -511,16 +547,18 @@ func TestScriptShowsATapsIntentAndNeverLocksOut(t *testing.T) {
 	}
 }
 
-var retry = regexp.MustCompile(`onerror = \(\) => setTimeout\([^,]*\.src = [^,]*, 2000\)`)
+// retry is the one request made again: the first since its camera joined,
+// 2 s after it fails.
+var retry = regexp.MustCompile(`if \(first\) setTimeout\(\(\) => again\(t\), 2000\)`)
 
-func TestScriptRequestsAFailedPictureAgain2sLater(t *testing.T) {
+func TestScriptRequestsAFailedFirstPictureOnceMore2sLater(t *testing.T) {
 	_, _, console := twoCameras(t)
 	m := script.FindStringSubmatch(get(console, "/").Body.String())
 	if m == nil {
 		t.Fatal("page has no script")
 	}
 	if !retry.MatchString(m[1]) {
-		t.Errorf("script does not request a failed picture again 2 s later: %q", m[1])
+		t.Errorf("script does not request a failed first picture again 2 s later: %q", m[1])
 	}
 	if strings.Contains(m[1], "lost") {
 		t.Errorf("script still requests a picture again on a camera's state: %q", m[1])

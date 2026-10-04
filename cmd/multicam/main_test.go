@@ -104,7 +104,7 @@ func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 	}
 	page := body(http.Get(base + "/"))
 	last := -1
-	for _, want := range []string{`data-camera="one"`, `<img src="/one/liveview"`, `data-camera="two"`, `<img src="/two/liveview"`} {
+	for _, want := range []string{`data-camera="one"`, `<img data-liveview="/one/liveview"`, `data-camera="two"`, `<img data-liveview="/two/liveview"`} {
 		i := strings.Index(page, want)
 		if i <= last {
 			t.Errorf("page lacks %s after byte %d: %q", want, last, page)

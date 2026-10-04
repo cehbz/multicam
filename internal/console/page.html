@@ -9,19 +9,34 @@
 html, body { height: 100%; margin: 0 }
 body { height: 100dvh; display: flex; flex-direction: column; background: #000; color: #fff; font: 13px/1.3 system-ui, sans-serif }
 button { margin: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent }
+svg { display: block; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round }
 
-/* The bar: Start all at the left, Stop all at the right, the console's own error between. */
+/* The bar: the menu, the server's connection and Start all at the left,
+   Stop all and Reload at the right, the console's own error between. */
 header { flex: none; height: 40px; display: flex; align-items: center }
-header button { height: 100%; padding: 0 14px; display: flex; align-items: center; gap: 6px }
-header button::before { content: ""; box-sizing: border-box; width: 20px; height: 20px }
+header > button { height: 100%; padding: 0 14px; display: flex; align-items: center; gap: 6px }
+#start::before, #stop::before { content: ""; box-sizing: border-box; width: 20px; height: 20px }
 #start::before { border: 2px solid #fff; border-radius: 50%; background: #e00 }
 #stop::before { border-radius: 2px; background: #fff }
 #fault { flex: 1; min-width: 0; overflow: hidden; text-align: center; text-overflow: ellipsis; white-space: nowrap; color: #fd0 }
+
+/* The dot is the server's connection: green connected, grey disconnected. */
+#dot { flex: none; width: 12px; height: 12px; border-radius: 50%; background: #0c0 }
+.off #dot { background: #666 }
+
+/* The menu opens under its button and closes on a tap elsewhere. */
+#menu { position: fixed; inset: 40px auto auto 4px; margin: 0; padding: 4px 0; border: 1px solid #333; border-radius: 4px; background: #111; color: #fff }
+#menu button { display: block; width: 100%; padding: 12px 28px 12px 16px; text-align: left; font-size: 15px }
+
+/* Disconnected, the commands are greyed and take no tap. */
+.off #start, .off #stop, .off .mark { opacity: .3 }
+.off #start, .off #stop, .off .tile { pointer-events: none }
 
 /* The tiles share the height under the bar; each picture is fitted whole in its tile. */
 main { flex: 1; min-height: 0; display: flex; flex-direction: column }
 .tile { flex: 1 1 0; min-height: 0; position: relative; display: block; width: 100%; overflow: hidden }
 .tile img, .tile video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none }
+.tile img:not([src]) { display: none }
 .name { position: absolute; top: 12px; left: 12px; padding: 1px 6px; border-radius: 3px; background: rgba(0, 0, 0, .55); font-size: 12px }
 
 /* The corner mark is what a tap does: a record disc, or a stop square while recording. */
@@ -35,53 +50,88 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column }
 
 .error { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 10px; background: rgba(0, 0, 0, .8); color: #fd0; text-align: left; white-space: pre-line; overflow-wrap: anywhere }
 .error:empty { display: none }
+
+/* The toast: a command's outcome, shown for a few seconds over the pictures. */
+#toast { position: fixed; left: 16px; right: 16px; bottom: 24px; width: fit-content; margin: 0 auto; padding: 8px 14px; border-radius: 4px; background: rgba(40, 40, 40, .92); pointer-events: none; opacity: 0; transition: opacity .3s }
+#toast.shown { opacity: 1 }
 </style>
+<body class="off">
 <header>
+<button id="open" popovertarget="menu" aria-label="Menu"><svg width="20" height="20" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+<div id="menu" popover>
+<button id="connect">Connect</button>
+<button id="disconnect">Disconnect</button>
+</div>
+<span id="dot"></span>
 <button id="start" aria-label="Start all">all</button>
 <output id="fault"></output>
 <button id="stop" aria-label="Stop all">all</button>
+<button id="reload" aria-label="Reload"><svg width="20" height="20" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg></button>
 </header>
 <main>
 {{range .Cameras}}<button class="tile" data-camera="{{.Name}}">
 {{if .Stream}}<video autoplay muted playsinline data-whep=":{{$.WHEPPort}}/{{.Stream}}/whep"></video>
-{{else}}<img src="/{{.Name}}/liveview" alt="{{.Name}} liveview">
+{{else}}<img data-liveview="/{{.Name}}/liveview" alt="{{.Name}} liveview">
 {{end}}<span class="name">{{.Name}}</span>
 <span class="mark"></span>
 <span class="error"></span>
 </button>
 {{end}}</main>
+<output id="toast"></output>
 <script>
 const start = document.getElementById('start');
 const stop = document.getElementById('stop');
 const fault = document.getElementById('fault');
+const menu = document.getElementById('menu');
+const toast = document.getElementById('toast');
 
-// A tile's state: the camera's last known recording status, what the last
-// tap asked for while the camera has yet to agree (null otherwise), the error
-// of its watch, and the refusal of its last command. A relayed picture whose
-// request fails is requested again 2 s later.
+// The server's connection as its events report it, and what the last menu
+// tap asked for until the server agrees or the tap is answered (null
+// otherwise). asked counts the taps: an answer ends only the last tap's
+// intent.
+const server = {connected: false, intent: null, asked: 0};
+
+// connected is what the dot shows: the tap's intent until the server agrees
+// or answers, else the server's connection.
+function connected() { return server.intent ?? server.connected; }
+
+// A tile's state: its camera's connection, and as its error the try's error
+// or the connection when not connected; the camera's last known recording
+// status; what the last tap asked for while the camera has yet to agree (null
+// otherwise); the refusal of its last command; and its picture: the running
+// request (null when none), whether it failed, and whether the next request
+// is the first since the camera joined.
 const tiles = new Map();
 for (const el of document.querySelectorAll('.tile')) {
-	const t = {el, error: el.querySelector('.error'), img: el.querySelector('img'), recording: false, intent: null, fault: '', refusal: ''};
+	const img = el.querySelector('img'), video = el.querySelector('video');
+	const t = {el, error: el.querySelector('.error'), connection: 'disconnected', fault: '', recording: false, intent: null, refusal: '',
+		picture: img ? relayed(img, img.dataset.liveview) : streamed(video, 'http://' + location.hostname + video.dataset.whep),
+		run: null, failed: false, first: true};
 	tiles.set(el.dataset.camera, t);
-	if (t.img) t.img.onerror = () => setTimeout(() => { t.img.src = t.img.src.split('?')[0] + '?' + Date.now(); }, 2000);
 	el.onclick = () => command('/' + encodeURIComponent(el.dataset.camera), [t], !shown(t));
 }
 const all = [...tiles.values()];
 start.onclick = () => command('', all, true);
 stop.onclick = () => command('', all, false);
+document.getElementById('connect').onclick = () => connect(true);
+document.getElementById('disconnect').onclick = () => connect(false);
+document.getElementById('reload').onclick = () => location.reload();
 
 // shown is what a tile's mark shows: the tap's intent until the camera
 // agrees or refuses, else the camera's state.
 function shown(t) { return t.intent ?? t.recording; }
 
-// draw shows every tile's state. A status is unread when its camera's watch
-// failed or the console's events aren't arriving.
+// draw shows the server's connection and every tile's state, and runs or
+// stops each picture. A status is unread when its camera isn't connected or
+// the console's events aren't arriving.
 function draw() {
+	document.body.classList.toggle('off', !connected());
 	const unanswered = fault.textContent !== '';
 	for (const t of all) {
 		t.el.classList.toggle('recording', shown(t));
-		t.el.classList.toggle('stale', unanswered || t.fault !== '');
+		t.el.classList.toggle('stale', unanswered || t.connection !== 'connected');
 		t.error.textContent = [...new Set([t.refusal, t.fault])].filter(Boolean).join('\n');
+		show(t);
 	}
 }
 
@@ -111,10 +161,42 @@ async function command(base, ts, recording) {
 	draw();
 }
 
-// The console pushes every camera's state on connection and then each
-// change, always the newest. A state that matches a tile's intent is the
-// camera agreeing. The browser reconnects a dropped stream by itself and the
-// states arrive again.
+// connect makes on the server's intended connection, shows it, and sends
+// Connect or Disconnect. The answer's news beyond the events is toasted: no
+// camera reached, or the cameras still recording.
+async function connect(on) {
+	menu.hidePopover();
+	const asked = ++server.asked;
+	server.intent = on;
+	draw();
+	const path = on ? '/connect' : '/disconnect';
+	try {
+		const r = await fetch(path, {method: 'POST'});
+		if (!r.ok) throw new Error('POST ' + path + ': ' + r.status);
+		const a = await r.json();
+		if (a.error === 'no camera answered') say('No camera answered');
+		if (a.recording?.length) say('Still recording: ' + a.recording.join(', '));
+		fault.textContent = '';
+	} catch (e) {
+		fault.textContent = 'console: ' + e.message;
+	}
+	if (server.asked === asked) server.intent = null;
+	draw();
+}
+
+// say shows text in the toast for 4 s.
+let toastTimer;
+function say(text) {
+	toast.textContent = text;
+	toast.classList.add('shown');
+	clearTimeout(toastTimer);
+	toastTimer = setTimeout(() => toast.classList.remove('shown'), 4000);
+}
+
+// The console pushes the server's connection and every camera's state on
+// connection, and then each change, always the newest. A state that matches
+// an intent is the server or camera agreeing. The browser reconnects a
+// dropped stream by itself and the states arrive again.
 const events = new EventSource('/events');
 events.onopen = () => {
 	fault.textContent = '';
@@ -124,36 +206,94 @@ events.onerror = () => {
 	fault.textContent = 'console: events disconnected';
 	draw();
 };
+events.addEventListener('connection', e => {
+	server.connected = JSON.parse(e.data).connection === 'connected';
+	if (server.intent === server.connected) server.intent = null;
+	draw();
+});
 events.onmessage = e => {
 	const s = JSON.parse(e.data);
 	const t = tiles.get(s.name);
 	if (!t) return;
+	t.connection = s.connection;
+	t.fault = s.connection === 'connected' ? '' : s.error || (s.connection === 'connecting' ? 'connecting' : 'not connected');
+	if (s.connection === 'connected') t.failed = false;
 	if ('recording' in s) {
 		t.recording = s.recording;
-		t.fault = '';
 		if (t.intent === t.recording) t.intent = null;
-	} else {
-		t.fault = s.error;
 	}
 	draw();
 };
 
-// play shows the stream at the WHEP endpoint url in video: the browser's
-// offer is posted and the answer set. The connection is made again 2 s
-// after it fails or ends.
-function play(video, url) {
-	const pc = new RTCPeerConnection();
-	let over = false;
-	const again = () => {
-		if (over) return;
-		over = true;
-		pc.close();
-		setTimeout(() => play(video, url), 2000);
+// show runs t's picture while its camera is connected and the server is
+// shown connected, and stops it otherwise. A picture not running is
+// requested afresh, unless it failed: the first request since the camera
+// joined is made again 2 s after it fails, and a later failure waits for the
+// camera's next report.
+function show(t) {
+	if (!connected() || t.connection !== 'connected') {
+		if (t.run) t.picture.stop();
+		t.run = null;
+		t.failed = false;
+		t.first = true;
+		return;
+	}
+	if (t.run || t.failed) return;
+	const run = t.run = {}, first = t.first;
+	t.first = false;
+	t.picture.start(() => {
+		if (t.run !== run) return;
+		t.picture.stop();
+		t.run = null;
+		t.failed = true;
+		if (first) setTimeout(() => again(t), 2000);
+	});
+}
+
+// again requests t's failed picture afresh.
+function again(t) {
+	t.failed = false;
+	show(t);
+}
+
+// relayed is the console's MJPEG relay at url shown in img. start requests
+// it afresh and calls failed if the request fails; stop ends it.
+function relayed(img, url) {
+	return {
+		start(failed) {
+			img.onerror = failed;
+			img.src = url + '?' + Date.now();
+		},
+		stop() {
+			img.onerror = null;
+			img.removeAttribute('src');
+		},
 	};
+}
+
+// streamed is the WHEP stream at url played in video. start connects to it
+// and calls failed if the connection fails; stop closes it.
+function streamed(video, url) {
+	let pc = null;
+	return {
+		start(failed) { pc = play(video, url, failed); },
+		stop() {
+			pc?.close();
+			pc = null;
+			video.srcObject = null;
+		},
+	};
+}
+
+// play plays the stream at the WHEP endpoint url in video: the browser's
+// offer is posted and the answer set. It returns the connection and calls
+// failed if the connection fails.
+function play(video, url, failed) {
+	const pc = new RTCPeerConnection();
 	pc.addTransceiver('video', {direction: 'recvonly'});
 	pc.ontrack = e => { video.srcObject = e.streams[0] || new MediaStream([e.track]); };
 	pc.onconnectionstatechange = () => {
-		if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) again();
+		if (pc.connectionState === 'failed') failed();
 	};
 	(async () => {
 		await pc.setLocalDescription(await pc.createOffer());
@@ -161,7 +301,8 @@ function play(video, url) {
 		const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/sdp'}, body: pc.localDescription.sdp});
 		if (!r.ok) throw new Error('POST ' + url + ': ' + r.status);
 		await pc.setRemoteDescription({type: 'answer', sdp: await r.text()});
-	})().catch(again);
+	})().catch(failed);
+	return pc;
 }
 
 // gathered resolves once pc's ICE candidates are gathered, or after 1 s.
@@ -177,6 +318,4 @@ function gathered(pc) {
 		};
 	});
 }
-
-for (const v of document.querySelectorAll('video[data-whep]')) play(v, 'http://' + location.hostname + v.dataset.whep);
 </script>
