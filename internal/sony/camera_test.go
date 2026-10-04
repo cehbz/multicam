@@ -339,8 +339,8 @@ func TestCameraOnAnInterfaceNeedsLinux(t *testing.T) {
 	}
 }
 
-// receive returns the next status from ch, failing the test if none arrives.
-func receive(t *testing.T, ch <-chan Status) Status {
+// receive returns the next state from ch, failing the test if none arrives.
+func receive(t *testing.T, ch <-chan State) State {
 	t.Helper()
 	select {
 	case s, ok := <-ch:
@@ -349,17 +349,17 @@ func receive(t *testing.T, ch <-chan Status) Status {
 		}
 		return s
 	case <-time.After(2 * time.Second):
-		t.Fatal("no status within 2 s")
+		t.Fatal("no state within 2 s")
 	}
-	return ""
+	return State{}
 }
 
 // silent fails the test if ch delivers anything within d.
-func silent(t *testing.T, ch <-chan Status, d time.Duration) {
+func silent(t *testing.T, ch <-chan State, d time.Duration) {
 	t.Helper()
 	select {
 	case s, ok := <-ch:
-		t.Fatalf("got %q, %v; want nothing", s, ok)
+		t.Fatalf("got %+v, %v; want nothing", s, ok)
 	case <-time.After(d):
 	}
 }
@@ -371,12 +371,12 @@ func TestWatchDeliversTheInitialStatusThenEachChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := receive(t, ch); got != "IDLE" {
+	if got := receive(t, ch).Status; got != "IDLE" {
 		t.Fatalf("initial status %q, want IDLE", got)
 	}
 	silent(t, ch, 50*time.Millisecond)
 	fake.Push("MovieWaitRecStart")
-	if got := receive(t, ch); got != "MovieWaitRecStart" {
+	if got := receive(t, ch).Status; got != "MovieWaitRecStart" {
 		t.Fatalf("status %q, want MovieWaitRecStart", got)
 	}
 	// Answers for other elements carry no cameraStatus; an unchanged status
@@ -384,7 +384,7 @@ func TestWatchDeliversTheInitialStatusThenEachChange(t *testing.T) {
 	fake.Push("")
 	fake.Push("MovieWaitRecStart")
 	fake.Push("MovieRecording")
-	if got := receive(t, ch); got != "MovieRecording" {
+	if got := receive(t, ch).Status; got != "MovieRecording" {
 		t.Fatalf("status %q, want MovieRecording", got)
 	}
 	silent(t, ch, 50*time.Millisecond)
@@ -402,7 +402,7 @@ func TestWatchPollsAgainAfterTheCameraTimesOutAPoll(t *testing.T) {
 	receive(t, ch)
 	fake.PushError(2, "Timeout")
 	fake.Push("MovieRecording")
-	if got := receive(t, ch); got != "MovieRecording" {
+	if got := receive(t, ch).Status; got != "MovieRecording" {
 		t.Fatalf("status %q, want MovieRecording", got)
 	}
 }
@@ -418,7 +418,7 @@ func TestWatchEndsWhenAPollFails(t *testing.T) {
 	select {
 	case s, ok := <-ch:
 		if ok {
-			t.Fatalf("got %q after a failed poll, want the channel closed", s)
+			t.Fatalf("got %+v after a failed poll, want the channel closed", s)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("channel not closed within 2 s of a failed poll")
@@ -440,7 +440,7 @@ func TestWatchClosesWhenTheContextEnds(t *testing.T) {
 	select {
 	case s, ok := <-ch:
 		if ok {
-			t.Fatalf("got %q after cancel, want the channel closed", s)
+			t.Fatalf("got %+v after cancel, want the channel closed", s)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("channel not closed within 2 s of cancel")
@@ -449,11 +449,170 @@ func TestWatchClosesWhenTheContextEnds(t *testing.T) {
 
 func TestWatchInitialReadFailureIsReturned(t *testing.T) {
 	fake := sonytest.NewCamera(t)
-	fake.Fail("getEvent", 40401, "Camera Not Ready")
+	fake.Fail("getEvent", 1, "Any")
 	ch, err := newCamera(t, fake).Watch(t.Context())
 	var camErr *Error
-	if !errors.As(err, &camErr) || camErr.Code != 40401 || ch != nil {
-		t.Errorf("Watch = %v, %v; want no channel and camera error 40401", ch, err)
+	if !errors.As(err, &camErr) || camErr.Code != 1 || ch != nil {
+		t.Errorf("Watch = %v, %v; want no channel and camera error 1", ch, err)
+	}
+	if got, want := fake.Calls(), []string{"getEvent@1.3"}; !slices.Equal(got, want) {
+		t.Errorf("camera calls %v, want %v", got, want)
+	}
+}
+
+// watched is the outcome of a Watch run in the background.
+type watched struct {
+	ch  <-chan State
+	err error
+}
+
+// watchInBackground starts cam's Watch and delivers its outcome.
+func watchInBackground(t *testing.T, cam *Camera) <-chan watched {
+	t.Helper()
+	done := make(chan watched, 1)
+	go func() {
+		ch, err := cam.Watch(t.Context())
+		done <- watched{ch, err}
+	}()
+	return done
+}
+
+// A body not yet ready after a join answers Camera Not Ready; Watch then
+// holds one long poll, which the body answers once it is ready or ends with
+// Timeout, and reads the state afresh.
+func TestWatchWaitsOutCameraNotReadyOnOneLongPoll(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		answer func(*sonytest.Camera)
+	}{
+		{"ready", func(f *sonytest.Camera) { f.Push("") }},
+		{"timeout", func(f *sonytest.Camera) { f.PushError(2, "Timeout") }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := sonytest.NewCamera(t)
+			fake.NotReady()
+			fake.ListLiveview(true)
+			done := watchInBackground(t, newCamera(t, fake))
+			select {
+			case w := <-done:
+				t.Fatalf("Watch = %v, %v before the long poll was answered", w.ch, w.err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			tt.answer(fake)
+			var w watched
+			select {
+			case w = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Watch did not return within 2 s of the long poll's answer")
+			}
+			if w.err != nil {
+				t.Fatalf("Watch: %v", w.err)
+			}
+			if got, want := receive(t, w.ch), (State{Status: StatusIdle, Liveview: true}); got != want {
+				t.Errorf("initial state %+v, want %+v", got, want)
+			}
+			if got, want := fake.Calls()[:3], []string{"getEvent@1.3", "getEvent@1.3+", "getEvent@1.3"}; !slices.Equal(got, want) {
+				t.Errorf("camera calls %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestWatchNotReadyLongPollFailureIsReturned(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.NotReady()
+	fake.PushError(40402, "Already Running Polling Api")
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	var camErr *Error
+	if !errors.As(err, &camErr) || camErr.Code != 40402 || ch != nil {
+		t.Errorf("Watch = %v, %v; want no channel and camera error 40402", ch, err)
+	}
+	if got, want := fake.Calls(), []string{"getEvent@1.3", "getEvent@1.3+"}; !slices.Equal(got, want) {
+		t.Errorf("camera calls %v, want %v", got, want)
+	}
+}
+
+// A body that answers the first read is not long-polled before its state is
+// delivered.
+func TestWatchReadsAReadyBodyOnce(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.PushError(2, "Timeout")
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive(t, ch)
+	fake.Push("MovieRecording")
+	if got := receive(t, ch).Status; got != "MovieRecording" {
+		t.Fatalf("status %q, want MovieRecording", got)
+	}
+	calls := fake.Calls()
+	if got, want := calls[:3], []string{"getEvent@1.3", "getEvent@1.3+", "getEvent@1.3+"}; !slices.Equal(got, want) {
+		t.Errorf("camera calls %v, want %v first", calls, want)
+	}
+	if n := slices.Index(calls[1:], "getEvent@1.3"); n >= 0 {
+		t.Errorf("camera calls %v: a second plain getEvent", calls)
+	}
+}
+
+// availableApiList is a getEvent result element listing names.
+func availableApiList(names ...string) map[string]any {
+	return map[string]any{"type": "availableApiList", "names": names}
+}
+
+// cameraStatus is a getEvent result element reporting status.
+func cameraStatus(status string) map[string]any {
+	return map[string]any{"type": "cameraStatus", "cameraStatus": status}
+}
+
+// A long-poll answer carries only what changed: an API list left null or
+// empty keeps the last one.
+func TestWatchKeepsTheAPIListAcrossAnswersWithout(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	fake.ListLiveview(true)
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := receive(t, ch), (State{Status: StatusIdle, Liveview: true}); got != want {
+		t.Fatalf("initial state %+v, want %+v", got, want)
+	}
+	for _, step := range []struct {
+		result []any
+		want   State
+	}{
+		{[]any{nil, cameraStatus("MovieRecording")}, State{Status: "MovieRecording", Liveview: true}},
+		{[]any{[]any{}, cameraStatus("IDLE")}, State{Status: StatusIdle, Liveview: true}},
+		{[]any{availableApiList("getEvent", "startMovieRec"), nil}, State{Status: StatusIdle}},
+		{[]any{[]any{}, cameraStatus("MovieRecording")}, State{Status: "MovieRecording"}},
+	} {
+		fake.PushResult(step.result...)
+		if got := receive(t, ch); got != step.want {
+			t.Errorf("after %v: state %+v, want %+v", step.result, got, step.want)
+		}
+	}
+}
+
+// Liveview becoming available is a change, delivered with the unchanged
+// status; the same list again is not.
+func TestWatchDeliversALiveviewAvailabilityChange(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := receive(t, ch), (State{Status: StatusIdle}); got != want {
+		t.Fatalf("initial state %+v, want %+v", got, want)
+	}
+	fake.PushResult(availableApiList("getEvent", "startLiveview", "stopLiveview"))
+	if got, want := receive(t, ch), (State{Status: StatusIdle, Liveview: true}); got != want {
+		t.Errorf("state %+v, want %+v", got, want)
+	}
+	fake.PushResult(availableApiList("getEvent", "startLiveview", "stopLiveview"))
+	silent(t, ch, 50*time.Millisecond)
+	fake.PushResult(availableApiList("getEvent"))
+	if got, want := receive(t, ch), (State{Status: StatusIdle}); got != want {
+		t.Errorf("state %+v, want %+v", got, want)
 	}
 }
 

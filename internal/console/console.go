@@ -71,8 +71,9 @@ type Status struct {
 	Picture   bool
 }
 
-// Camera is what the console needs of a camera. The page plays its picture
-// only while its watch says the picture can be played.
+// Camera is what the console needs of a camera. The page requests its
+// picture when its watch says the picture can be played and stops it when the
+// watch says it can't.
 type Camera interface {
 	StartRecording(ctx context.Context) error
 	StopRecording(ctx context.Context) error

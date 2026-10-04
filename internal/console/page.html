@@ -100,14 +100,13 @@ function connected() { return server.intent ?? server.connected; }
 // status; what the last tap asked for while the camera has yet to agree (null
 // otherwise); the refusal of its last command; and its picture: whether the
 // camera's state says it can be played, the running request (null when
-// none), whether it failed, and whether the next request is the first since
-// it became playable.
+// none) and whether it failed.
 const tiles = new Map();
 for (const el of document.querySelectorAll('.tile')) {
 	const img = el.querySelector('img'), video = el.querySelector('video');
 	const t = {el, error: el.querySelector('.error'), connection: 'disconnected', fault: '', recording: false, intent: null, refusal: '',
 		picture: img ? relayed(img, img.dataset.liveview) : streamed(video, 'http://' + location.hostname + video.dataset.whep),
-		playable: false, run: null, failed: false, first: true};
+		playable: false, run: null, failed: false};
 	tiles.set(el.dataset.camera, t);
 	el.onclick = () => command('/' + encodeURIComponent(el.dataset.camera), [t], !shown(t));
 }
@@ -229,33 +228,23 @@ events.onmessage = e => {
 
 // show runs t's picture while the server is shown connected, its camera is
 // connected and its state says the picture can be played, and stops it
-// otherwise. A picture not running is requested afresh, unless it failed:
-// the first request since it became playable is made again 2 s after it
-// fails, and a later failure waits for the camera's next report.
+// otherwise. A picture not running is requested afresh, unless it failed: a
+// failure waits for the camera's next report.
 function show(t) {
 	if (!connected() || t.connection !== 'connected' || !t.playable) {
 		if (t.run) t.picture.stop();
 		t.run = null;
 		t.failed = false;
-		t.first = true;
 		return;
 	}
 	if (t.run || t.failed) return;
-	const run = t.run = {}, first = t.first;
-	t.first = false;
+	const run = t.run = {};
 	t.picture.start(() => {
 		if (t.run !== run) return;
 		t.picture.stop();
 		t.run = null;
 		t.failed = true;
-		if (first) setTimeout(() => again(t), 2000);
 	});
-}
-
-// again requests t's failed picture afresh.
-function again(t) {
-	t.failed = false;
-	show(t);
 }
 
 // relayed is the console's MJPEG relay at url shown in img. start requests

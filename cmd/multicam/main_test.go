@@ -70,6 +70,8 @@ func firstParts(t *testing.T, url string, n int) [][]byte {
 
 func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 	sonyFake, second := sonytest.NewCamera(t), sonytest.NewCamera(t)
+	sonyFake.ListLiveview(true)
+	second.ListLiveview(true)
 	config := filepath.Join(t.TempDir(), "multicam.toml")
 	text := fmt.Sprintf("[[camera]]\nname = \"one\"\nkind = \"sony\"\nendpoint = %q\n[[camera]]\nname = \"two\"\nkind = \"sony\"\nendpoint = %q\n",
 		sonyFake.Endpoint(), second.Endpoint())

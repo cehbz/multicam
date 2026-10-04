@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -23,6 +24,14 @@ type Status string
 // StatusIdle is the status a body returns to after a stop, and the only one
 // that accepts a start.
 const StatusIdle Status = "IDLE"
+
+// State is a camera's state as Watch reports it: its status, and whether its
+// liveview can start, which it can while the camera lists startLiveview among
+// its available APIs.
+type State struct {
+	Status   Status
+	Liveview bool
+}
 
 // Camera is one body, reached at its camera service endpoint. Its connections
 // are its own, since both bodies answer at the same address.
@@ -113,7 +122,7 @@ func (c *Camera) awaitStartGap(ctx context.Context) error {
 func (c *Camera) awaitIdle(ctx context.Context) (time.Time, error) {
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		s, err := c.status(ctx, false)
+		s, err := c.status(ctx)
 		if err != nil {
 			return time.Time{}, err
 		}
@@ -144,17 +153,23 @@ func sleepUntil(ctx context.Context, t time.Time) error {
 	}
 }
 
-// Watch delivers the camera's status, the current one first and then each
-// change, until ctx ends or a poll fails and the channel closes. It holds one
-// long poll on its own connection; a poll the camera ends unchanged (Timeout)
-// is repeated. One Watch per camera: the camera allows one long poll at a
-// time.
-func (c *Camera) Watch(ctx context.Context) (<-chan Status, error) {
-	cur, err := c.status(ctx, false)
+// Watch delivers the camera's state, the current one first and then each
+// change, until ctx ends or a poll fails and the channel closes. A camera not
+// ready yet (Camera Not Ready, as right after a client joins) is read again
+// after one long poll, which it answers once it is ready. It holds one long
+// poll on its own connection; a poll the camera ends unchanged (Timeout) is
+// repeated, and an answer without an API list keeps the last one. One Watch
+// per camera: the camera allows one long poll at a time.
+func (c *Camera) Watch(ctx context.Context) (<-chan State, error) {
+	ev, err := c.event(ctx, false)
+	if errorCode(err) == 40401 {
+		ev, err = c.whenReady(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan Status, 1)
+	cur := State{}.update(ev)
+	ch := make(chan State, 1)
 	ch <- cur
 	c.mu.Lock()
 	c.watching = true
@@ -167,26 +182,27 @@ func (c *Camera) Watch(ctx context.Context) (<-chan Status, error) {
 			c.mu.Unlock()
 		}()
 		for ctx.Err() == nil {
-			s, err := c.status(ctx, true)
-			var camErr *Error
+			ev, err := c.event(ctx, true)
 			switch {
 			case ctx.Err() != nil:
 				return
-			case errors.As(err, &camErr) && camErr.Code == 2:
+			case errorCode(err) == 2:
 				continue
 			case err != nil:
 				return
-			case s == "" || s == cur:
+			}
+			next := cur.update(ev)
+			if next == cur {
 				continue
 			}
-			if s == StatusIdle {
+			if next.Status == StatusIdle && cur.Status != StatusIdle {
 				c.mu.Lock()
 				c.idleAt = time.Now()
 				c.mu.Unlock()
 			}
-			cur = s
+			cur = next
 			select {
-			case ch <- s:
+			case ch <- cur:
 			case <-ctx.Done():
 				return
 			}
@@ -195,17 +211,54 @@ func (c *Camera) Watch(ctx context.Context) (<-chan Status, error) {
 	return ch, nil
 }
 
-// status is one getEvent's cameraStatus, empty when the answer has none.
-func (c *Camera) status(ctx context.Context, longPolling bool) (Status, error) {
+// whenReady is the getEvent of a camera that was not ready, read once a long
+// poll returns or times out.
+func (c *Camera) whenReady(ctx context.Context) (*Event, error) {
+	if _, err := c.event(ctx, true); err != nil && errorCode(err) != 2 {
+		return nil, err
+	}
+	return c.event(ctx, false)
+}
+
+// errorCode is the code of the camera error err carries, 0 when it carries
+// none.
+func errorCode(err error) int {
+	var camErr *Error
+	if errors.As(err, &camErr) {
+		return camErr.Code
+	}
+	return 0
+}
+
+// update is s with what ev reports: its cameraStatus and its API list, each
+// when present.
+func (s State) update(ev *Event) State {
+	if ev.CameraStatus != "" {
+		s.Status = Status(ev.CameraStatus)
+	}
+	if _, listed := ev.Types["availableApiList"]; listed {
+		s.Liveview = slices.Contains(ev.APINames, "startLiveview")
+	}
+	return s
+}
+
+// event is one getEvent.
+func (c *Camera) event(ctx context.Context, longPolling bool) (*Event, error) {
 	client := c.rpc
 	if longPolling {
 		client = c.events
 	}
 	ex, err := client.Call(ctx, "getEvent", "1.3", longPolling)
 	if err != nil {
-		return "", fmt.Errorf("getEvent: %w", err)
+		return nil, fmt.Errorf("getEvent: %w", err)
 	}
-	ev, err := ex.Decoded.Event()
+	return ex.Decoded.Event()
+}
+
+// status is the cameraStatus of one getEvent without long polling, empty when
+// the answer has none.
+func (c *Camera) status(ctx context.Context) (Status, error) {
+	ev, err := c.event(ctx, false)
 	if err != nil {
 		return "", err
 	}
@@ -224,7 +277,7 @@ func (c *Camera) call(ctx context.Context, method string) error {
 // MovieWaitRecStart, which leads to it. MovieWaitRecStop and MovieSaving,
 // which follow a stop, are not recording.
 func (c *Camera) Recording(ctx context.Context) (bool, error) {
-	s, err := c.status(ctx, false)
+	s, err := c.status(ctx)
 	if err != nil {
 		return false, err
 	}

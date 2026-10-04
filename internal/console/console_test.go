@@ -566,18 +566,28 @@ func TestScriptShowsATapsIntentAndNeverLocksOut(t *testing.T) {
 	}
 }
 
-// retry is the one request made again: the first since its camera joined,
-// 2 s after it fails.
-var retry = regexp.MustCompile(`if \(first\) setTimeout\(\(\) => again\(t\), 2000\)`)
+// A failed picture is requested again on its camera's next report, never on
+// a timer, since a picture is requested once it becomes playable.
+var (
+	failedClears = regexp.MustCompile(`if \(s\.connection === 'connected'\) t\.failed = false;`)
+	timedRequest = regexp.MustCompile(`setTimeout\([^;]*\b(again|show)\(`)
+	firstRequest = regexp.MustCompile(`\bt\.first\b`)
+)
 
-func TestScriptRequestsAFailedFirstPictureOnceMore2sLater(t *testing.T) {
+func TestScriptRequestsAFailedPictureAgainOnlyOnItsCamerasReport(t *testing.T) {
 	_, _, console := twoCameras(t)
 	m := script.FindStringSubmatch(get(console, "/").Body.String())
 	if m == nil {
 		t.Fatal("page has no script")
 	}
-	if !retry.MatchString(m[1]) {
-		t.Errorf("script does not request a failed first picture again 2 s later: %q", m[1])
+	if !failedClears.MatchString(m[1]) {
+		t.Errorf("script does not clear a failed picture on its camera's report: %q", m[1])
+	}
+	if r := timedRequest.FindString(m[1]); r != "" {
+		t.Errorf("script requests a failed picture again on a timer: %s", r)
+	}
+	if r := firstRequest.FindString(m[1]); r != "" {
+		t.Errorf("script still tracks a picture's first request: %s", r)
 	}
 	if strings.Contains(m[1], "lost") {
 		t.Errorf("script still requests a picture again on a camera's state: %q", m[1])

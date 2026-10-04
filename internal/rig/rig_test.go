@@ -239,10 +239,9 @@ func receive(t *testing.T, ch <-chan console.Status) console.Status {
 	}
 }
 
-// A Sony body's picture, which the console relays, can be played whenever
-// the body is watched.
 func TestSonyBodyIsRecordingWhileItsStatusIsMovieRecording(t *testing.T) {
 	fake := sonytest.NewCamera(t)
+	fake.ListLiveview(true)
 	cam, err := sonyBody{Endpoint: fake.Endpoint()}.open("body", noKeeper)
 	if err != nil {
 		t.Fatal(err)
@@ -268,6 +267,39 @@ func TestSonyBodyIsRecordingWhileItsStatusIsMovieRecording(t *testing.T) {
 	cancel()
 	if _, ok := <-ch; ok {
 		t.Error("the watch delivered after its context ended")
+	}
+}
+
+// A Sony body's picture, which the console relays, can be played while the
+// body lists startLiveview.
+func TestSonyBodysPictureCanBePlayedWhileItListsStartLiveview(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	cam, err := sonyBody{Endpoint: fake.Endpoint()}.open("body", noKeeper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := cam.Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := receive(t, ch), (console.Status{}); got != want {
+		t.Errorf("status before startLiveview is listed %+v, want %+v", got, want)
+	}
+	apis := func(names ...string) map[string]any {
+		return map[string]any{"type": "availableApiList", "names": names}
+	}
+	for _, step := range []struct {
+		result []any
+		want   console.Status
+	}{
+		{[]any{apis("getEvent", "startLiveview", "stopLiveview")}, console.Status{Picture: true}},
+		{[]any{nil, map[string]any{"type": "cameraStatus", "cameraStatus": "MovieRecording"}}, console.Status{Recording: true, Picture: true}},
+		{[]any{apis("getEvent", "stopMovieRec")}, console.Status{Recording: true}},
+	} {
+		fake.PushResult(step.result...)
+		if got := receive(t, ch); got != step.want {
+			t.Errorf("after %v: status %+v, want %+v", step.result, got, step.want)
+		}
 	}
 }
 

@@ -16,7 +16,8 @@ import (
 )
 
 // Camera simulates a legacy-API body: the rec-mode API list appears only
-// after startRecMode and a NotReady interval, startMovieRec only in movie mode.
+// after startRecMode and a NotReady interval, startMovieRec only in movie mode,
+// and startLiveview outside rec mode only once listed with ListLiveview.
 // Its liveview stream repeats Frames in order until the client disconnects,
 // each JPEG packet followed by a frame-info packet. A long-polling getEvent
 // blocks until an answer is scripted with Push or PushError, or the client
@@ -30,6 +31,8 @@ type Camera struct {
 	mu           sync.Mutex
 	recMode      bool
 	readyPolls   int
+	notReady     bool // getEvent without long polling answers 40401
+	listed       bool // startLiveview listed outside rec mode
 	shootMode    string
 	recording    bool
 	zoom         int
@@ -47,6 +50,7 @@ type Camera struct {
 type event struct {
 	status string // the cameraStatus, or none when empty
 	err    []any  // a camera error in place of a result
+	result []any  // the result as given, when not nil
 }
 
 // NewCamera starts a fake camera that is shut down when the test ends.
@@ -101,6 +105,10 @@ func (c *Camera) SetCameraStatus(status string) {
 // answer without a cameraStatus element.
 func (c *Camera) Push(status string) { c.push(event{status: status}) }
 
+// PushResult scripts the next long-polling getEvent's answer as the result
+// elems, as given.
+func (c *Camera) PushResult(elems ...any) { c.push(event{result: elems}) }
+
 // PushError scripts the next long-polling getEvent to answer with a camera
 // error.
 func (c *Camera) PushError(code int, message string) { c.push(event{err: []any{code, message}}) }
@@ -111,6 +119,23 @@ func (c *Camera) push(e event) {
 	c.events = append(c.events, e)
 	close(c.wake)
 	c.wake = make(chan struct{})
+}
+
+// NotReady makes getEvent without long polling answer camera error 40401
+// (Camera Not Ready) until the next long poll is answered, as a body does
+// right after a client joins.
+func (c *Camera) NotReady() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.notReady = true
+}
+
+// ListLiveview puts startLiveview and stopLiveview in the API list outside
+// rec mode, or with false leaves them to rec mode.
+func (c *Camera) ListLiveview(listed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listed = listed
 }
 
 // Busy makes method take d to answer. MostInFlight counts busy calls.
@@ -135,6 +160,8 @@ func (c *Camera) apis() []string {
 		if c.shootMode == "movie" {
 			l = append(l, "startMovieRec", "stopMovieRec")
 		}
+	} else if c.listed {
+		l = append(l, "startLiveview", "stopLiveview")
 	}
 	return l
 }
@@ -214,8 +241,13 @@ func (c *Camera) rpc(w http.ResponseWriter, r *http.Request) {
 			}
 			e := c.events[0]
 			c.events = c.events[1:]
+			c.notReady = false
 			if e.err != nil {
 				reply("error", e.err)
+				return
+			}
+			if e.result != nil {
+				reply("result", e.result)
 				return
 			}
 			if e.status == "" {
@@ -223,6 +255,9 @@ func (c *Camera) rpc(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			c.status = e.status
+		} else if c.notReady {
+			reply("error", []any{40401, "Camera Not Ready"})
+			return
 		}
 		status := "IDLE"
 		switch {

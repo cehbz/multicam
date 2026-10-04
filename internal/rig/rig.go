@@ -162,12 +162,12 @@ func watch[T any](ctx context.Context, source func(context.Context) (<-chan T, e
 
 // sonyCamera is a Sony body as the console watches it: recording while its
 // status is MovieRecording, its picture, which the console relays, playable
-// whenever it is watched.
+// while its liveview can start.
 type sonyCamera struct{ *sony.Camera }
 
 func (c sonyCamera) Watch(ctx context.Context) (<-chan console.Status, error) {
-	return watch(ctx, c.Camera.Watch, func(s sony.Status) console.Status {
-		return console.Status{Recording: s == "MovieRecording", Picture: true}
+	return watch(ctx, c.Camera.Watch, func(s sony.State) console.Status {
+		return console.Status{Recording: s.Status == "MovieRecording", Picture: s.Liveview}
 	})
 }
 
