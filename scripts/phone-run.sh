@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Cross-build multicam and push it, the rig's config, the phone scripts
-# (phone/*.sh to /data/local/tmp/mc) and the Termux:Widget tasks (to
-# ~/.shortcuts/tasks in Termux's home) over adb, then restart the server through
-# rig.sh so it runs detached from this session, with the console port
-# forwarded to this Mac. With --foreground the server instead runs in this
-# adb session as root and Ctrl-C stops it; the camera links and MediaMTX stay
-# whatever rig.sh left them.
+# Cross-build multicam and push it, its config, wpa_supplicant with its
+# libraries (bin/wifi) and the supervisor (phone/multicam.sh) to the phone over
+# adb, install the supervisor in Magisk's service.d, make sure it runs, and end
+# the running server with SIGTERM so the supervisor starts the new one. The
+# console port is forwarded to this Mac.
+# With --foreground the supervisor holds off (a hold file), the new server runs
+# in this adb session as root, Ctrl-C stops it, and on exit the hold file is
+# removed so the supervisor takes over.
 # Usage: scripts/phone-run.sh [--foreground]
 set -uo pipefail
 
+export ANDROID_SERIAL=8ALY0MYQV
 repo=$(cd "$(dirname "$0")/.." && pwd)
 bin=$repo/bin/multicam-android
 remote=/data/local/tmp/multicam
 mc=/data/local/tmp/mc
 config=$mc/multicam.toml
-termux_home=/data/data/com.termux/files/home
+hold=$mc/hold
+wifi=/data/local/tmp/wifi
+service=/data/adb/service.d/multicam.sh
 port=8080
 foreground=0
 [[ ${1:-} == --foreground ]] && foreground=1
@@ -29,40 +33,38 @@ stop_remote() {
 		pkill -9 -x multicam; sleep 1; ! pidof multicam >/dev/null'"
 }
 
-# The binary is renamed over the old one, so a running server keeps its
-# inode and rig.sh still finds it by /proc.
+# The binary is renamed over the old one, so a running server keeps its inode.
 adb push "$bin" "$remote.new" >/dev/null || exit 1
 adb shell "mv $remote.new $remote && chmod 755 $remote" || exit 1
-adb shell "mkdir -p $mc/shortcuts" || exit 1
+adb shell "mkdir -p $mc" || exit 1
 adb push "$repo/multicam.phone.toml" "$config" >/dev/null || exit 1
-adb push "$repo/phone/links.sh" "$repo/phone/udhcpc.sh" "$repo/phone/rig.sh" "$repo/phone/notify.sh" "$mc/" >/dev/null || exit 1
-adb shell "chmod 755 $mc/links.sh $mc/udhcpc.sh $mc/rig.sh $mc/notify.sh" || exit 1
-if [[ -f $repo/phone/links.conf ]]; then
-	adb push "$repo/phone/links.conf" "$mc/" >/dev/null || exit 1
-	adb shell "chmod 600 $mc/links.conf" || exit 1
+adb push "$repo/phone/multicam.sh" "$mc/multicam.sh" >/dev/null || exit 1
+
+if [[ -d $repo/bin/wifi ]]; then
+	adb shell "mkdir -p $wifi" || exit 1
+	adb push "$repo/bin/wifi/bin" "$repo/bin/wifi/lib" "$wifi/" >/dev/null || exit 1
+	adb shell "chmod 755 $wifi/bin/*" || exit 1
+else
+	echo "bin/wifi is missing: the phone's copy of $wifi is used" >&2
 fi
 
-# Termux's home is private to its uid, so the tasks go in as root and are
-# given back to that uid with the SELinux label its files carry.
-owner=$(adb shell "su -c 'stat -c %u:%g $termux_home'" | tr -d '\r')
-[[ $owner =~ ^[0-9]+:[0-9]+$ ]] || {
-	echo "could not read the owner of $termux_home" >&2
-	exit 1
-}
-adb push "$repo"/phone/shortcuts/tasks/* "$mc/shortcuts/" >/dev/null || exit 1
-adb shell "su -c 'mkdir -p $termux_home/.shortcuts/tasks &&
-	cp $mc/shortcuts/* $termux_home/.shortcuts/tasks/ &&
-	chown -R $owner $termux_home/.shortcuts &&
-	chmod 700 $termux_home/.shortcuts $termux_home/.shortcuts/tasks $termux_home/.shortcuts/tasks/* &&
-	restorecon -RD $termux_home/.shortcuts'" || exit 1
+# service.d is root's: Magisk runs only root-owned executables there.
+adb shell "su -c 'cp $mc/multicam.sh $service && chown root:root $service &&
+	chmod 755 $service'" || exit 1
 
 adb forward "tcp:$port" "tcp:$port" >/dev/null || exit 1
 
+# Starts the supervisor detached, all three streams redirected so adb returns.
+# A running one signals the first and exits, which clears its crash count.
+start_supervisor() {
+	adb shell "su -c 'sh $service </dev/null >/dev/null 2>&1 &'"
+}
+
 if [[ $foreground == 0 ]]; then
-	adb shell "su -c '$mc/rig.sh restart'"
-	rc=$?
-	echo "Console at http://localhost:$port/ (rig.sh on the phone stops it)"
-	exit $rc
+	start_supervisor || exit 1
+	adb shell "su -c 'pkill -x multicam'"
+	echo "Console at http://localhost:$port/ (the supervisor restarts the server)"
+	exit 0
 fi
 
 cleaned=0
@@ -75,11 +77,15 @@ cleanup() {
 		echo "warning: multicam is still running on the phone" >&2
 		echo "  run: adb shell su -c 'pkill -9 -x multicam'" >&2
 	fi
+	adb shell "su -c 'rm -f $hold'"
 	adb forward --remove "tcp:$port" >/dev/null 2>&1
+	echo "The supervisor runs the server again"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+adb shell "su -c 'touch $hold'" || exit 1
+start_supervisor || exit 1
 if ! stop_remote; then
 	echo "could not stop the previous multicam on the phone" >&2
 	exit 1
@@ -87,7 +93,7 @@ fi
 echo "Console at http://localhost:$port/ (Ctrl-C stops multicam on the phone)"
 
 # -t gives the phone side a terminal, so Ctrl-C reaches multicam as SIGINT.
-adb shell -t "su -c '$remote $config'"
+adb shell -t "su -c 'cd $mc && $remote $config'"
 rc=$?
 echo "multicam exited $rc"
 exit $rc
