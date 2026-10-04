@@ -745,6 +745,7 @@ func TestUnknownCameraIsNotFound(t *testing.T) {
 // counted.
 type stills struct {
 	frames   chan []byte
+	stopping chan struct{} // when set, Close waits for it, as a stop to a body out of reach does
 	startErr error
 	starts   atomic.Int32
 	closes   atomic.Int32
@@ -780,6 +781,9 @@ func (s *stillsSession) Next() ([]byte, error) {
 
 func (s *stillsSession) Close() error {
 	s.cam.closes.Add(1)
+	if s.cam.stopping != nil {
+		<-s.cam.stopping
+	}
 	return nil
 }
 
@@ -1084,6 +1088,36 @@ func TestTheFeedEndsWhenTheCameraDrops(t *testing.T) {
 		}
 		if rec := getWithin(console, "/phone/liveview"); rec.Code != http.StatusServiceUnavailable {
 			t.Errorf("picture after the drop: status %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+	})
+}
+
+// A lost link takes the body's liveview with it: the feed ends without
+// stopping it, and the camera's one try comes at once.
+func TestALostLinkEndsTheFeedWithoutStoppingTheBody(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cam := newStills()
+		cam.stopping = make(chan struct{})
+		defer close(cam.stopping)
+		named, f, l := linked("body")
+		named.Picture = Relay(cam)
+		console := New(t.Context(), []Named{named}, saved(t, true))
+		synctest.Wait()
+		f.watch(t, 0) <- Status{Picture: true}
+		synctest.Wait()
+		v := openViewer(t, console, "/body/liveview", false)
+		cam.show(t, "screen 1")
+
+		l.last().lose(errors.New("wlan1: lost DIRECT-body: CTRL-EVENT-DISCONNECTED"))
+		synctest.Wait()
+		if n := cam.closes.Load(); n != 0 {
+			t.Errorf("session closed %d times after the link was lost, want none", n)
+		}
+		if joins, _ := l.counts(); joins != 2 {
+			t.Errorf("%d joins after the link was lost, want the first and its try at once", joins)
+		}
+		if !v.ended() {
+			t.Error("the picture still streams after the link was lost")
 		}
 	})
 }

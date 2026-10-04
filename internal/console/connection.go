@@ -443,12 +443,16 @@ func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, er
 // follow shows u's statuses until it drops, its link lost or its watch ended,
 // or the session ends, and returns why, with u down and its feed ended.
 func (n *connection) follow(session context.Context, cc *cameraConn, u *upCamera) error {
+	lostLink := false
 	defer func() {
-		u.down()
 		n.mu.Lock()
 		f := cc.feed
 		cc.feed = nil
 		n.mu.Unlock()
+		if f != nil && lostLink {
+			f.abandon()
+		}
+		u.down()
 		if f != nil {
 			<-f.ended
 		}
@@ -467,6 +471,7 @@ func (n *connection) follow(session context.Context, cc *cameraConn, u *upCamera
 			n.take(cc, u.live, st)
 			n.mu.Unlock()
 		case <-lost:
+			lostLink = true
 			return u.joined.Err()
 		case <-session.Done():
 			return session.Err()

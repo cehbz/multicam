@@ -468,12 +468,13 @@ var errFeedEnded = errors.New("feed ended")
 // session of its source's liveview, whose frames every viewer shares. It runs
 // until the camera's connection ends or the source ends the session.
 type feed struct {
-	ended chan struct{} // closed once the feed has stopped and its session is closed
+	ended chan struct{} // closed once the feed has stopped and its session is closed or abandoned
 
-	mu      sync.Mutex
-	frame   []byte        // the latest frame; nil before the first
-	fresh   chan struct{} // closed when a newer frame arrives or the feed stops
-	stopped bool
+	mu        sync.Mutex
+	abandoned bool          // the body is out of reach: the session ends with its context, unstopped
+	frame     []byte        // the latest frame; nil before the first
+	fresh     chan struct{} // closed when a newer frame arrives or the feed stops
+	stopped   bool
 }
 
 func newFeed() *feed { return &feed{ended: make(chan struct{}), fresh: make(chan struct{})} }
@@ -512,9 +513,23 @@ func (f *feed) run(ctx context.Context, name string, src Source[Liveview], chang
 	if f.stop() {
 		changed()
 	}
+	f.mu.Lock()
+	abandoned := f.abandoned
+	f.mu.Unlock()
+	if abandoned {
+		return
+	}
 	if err := lv.Close(); err != nil {
 		slog.Error("liveview close", "camera", name, "err", err)
 	}
+}
+
+// abandon makes the feed end without stopping the body's liveview, which a
+// lost link has taken with it.
+func (f *feed) abandon() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.abandoned = true
 }
 
 // stop stops the feed and reports whether it was delivering frames.
