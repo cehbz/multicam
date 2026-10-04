@@ -1,5 +1,11 @@
 # The rig on the phone.
 
+# The MediaMTX the server runs and keeps running, receiving the Pixel 9's
+# SRT livestream. dir (its working directory, where it finds mediamtx.yml)
+# defaults to the executable's directory and log to mediamtx.log in it.
+[mediamtx]
+path = "/data/local/tmp/mc/mtx/mediamtx"
+
 # Sony bodies, each joined on its own Wi-Fi interface. endpoint is optional
 # and defaults to the bodies' fixed camera service. start_gap is how long a
 # start waits after the body reports IDLE: the RX100M6 refuses one sooner

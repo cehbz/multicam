@@ -13,10 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/cehbz/multicam/internal/mediamtx"
 	"github.com/cehbz/multicam/internal/rig"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
@@ -211,5 +214,45 @@ func nextEvent(t *testing.T, lines <-chan string) string {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no event arrived")
 		return ""
+	}
+}
+
+func TestRunKeepsMediaMTXRunningAndEndsItWithTheServer(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	exe := filepath.Join(dir, "fakemtx")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho $$ > "+pidFile+"\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &rig.Rig{MediaMTX: &mediamtx.Server{Path: exe, Dir: dir, Log: filepath.Join(dir, "log"), RestartDelay: time.Second}}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, ln, r) }()
+	var pid int
+	for deadline := time.Now().Add(5 * time.Second); pid == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("MediaMTX did not start")
+		}
+		b, _ := os.ReadFile(pidFile)
+		if strings.HasSuffix(string(b), "\n") {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return")
+	}
+	if syscall.Kill(pid, 0) == nil {
+		syscall.Kill(pid, syscall.SIGKILL)
+		t.Errorf("MediaMTX %d still running after run returned", pid)
 	}
 }

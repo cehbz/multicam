@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/cehbz/multicam/internal/console"
@@ -60,7 +61,8 @@ func configPath(args []string) (string, error) {
 
 // run serves the console for the rig's cameras on ln until ctx is done. The
 // console watches the cameras and requests end with ctx, and run returns
-// once their liveview sessions have closed.
+// once their liveview sessions have closed. The rig's MediaMTX, if any, runs
+// until ctx is done and is ended before run returns.
 func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
 	var names []string
 	for _, c := range r.Cameras {
@@ -69,6 +71,14 @@ func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
 	srv := &http.Server{
 		Handler:     console.New(ctx, r.Cameras),
 		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
+	var media sync.WaitGroup
+	if r.MediaMTX != nil {
+		media.Go(func() {
+			if err := r.MediaMTX.Run(ctx); err != nil {
+				slog.Error("mediamtx", "error", err)
+			}
+		})
 	}
 	stopped := make(chan error, 1)
 	go func() {
@@ -79,5 +89,7 @@ func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
 	if err := srv.Serve(ln); err != http.ErrServerClosed {
 		return err
 	}
-	return <-stopped
+	err := <-stopped
+	media.Wait()
+	return err
 }

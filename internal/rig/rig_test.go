@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cehbz/multicam/internal/console"
+	"github.com/cehbz/multicam/internal/mediamtx"
 	"github.com/cehbz/multicam/internal/sony"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
@@ -229,5 +231,80 @@ func TestLoadOfInterfacesNeedsLinux(t *testing.T) {
 	rig, err := Load(phoneConfig)
 	if err == nil || !strings.Contains(err.Error(), "rx10m4") || !strings.Contains(err.Error(), "wlan1") {
 		t.Errorf("Load = %v, %v; want an error naming camera rx10m4 and interface wlan1", rig, err)
+	}
+}
+
+func TestParseMediaMTX(t *testing.T) {
+	cam := "[[camera]]\nname = \"a\"\nkind = \"sony\"\n"
+	tests := []struct {
+		name    string
+		text    string
+		want    *mediamtx.Server
+		wantErr string
+	}{
+		{"none when the config does not name it", cam, nil, ""},
+		{
+			"its path alone: its directory and a log in it",
+			"[mediamtx]\npath = \"/m/mtx/mediamtx\"\n" + cam,
+			&mediamtx.Server{Path: "/m/mtx/mediamtx", Dir: "/m/mtx", Log: "/m/mtx/mediamtx.log", RestartDelay: time.Second},
+			"",
+		},
+		{
+			"its directory and log",
+			"[mediamtx]\npath = \"/bin/mediamtx\"\ndir = \"/etc/m\"\nlog = \"/var/m.log\"\n" + cam,
+			&mediamtx.Server{Path: "/bin/mediamtx", Dir: "/etc/m", Log: "/var/m.log", RestartDelay: time.Second},
+			"",
+		},
+		{"no path", "[mediamtx]\ndir = \"/x\"\n" + cam, nil, "mediamtx: no path"},
+		{"unknown key", "[mediamtx]\npath = \"/x\"\nport = 1\n" + cam, nil, "port"},
+		{"path not a string", "[mediamtx]\npath = 3\n" + cam, nil, "mediamtx"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseMediaMTX(tt.text)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("parseMediaMTX = %v, %v; want an error with %q", got, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseMediaMTX = %+v, %v; want %+v", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseAcceptsTheMediaMTXTable(t *testing.T) {
+	text := "[mediamtx]\npath = \"/x/mediamtx\"\n[[camera]]\nname = \"a\"\nkind = \"sony\"\n"
+	if got, err := parse(text); err != nil || len(got) != 1 {
+		t.Errorf("parse = %v, %v; want the one camera", got, err)
+	}
+}
+
+func TestPhoneConfigRunsMediaMTXWhereRigShPutIt(t *testing.T) {
+	text, err := os.ReadFile(phoneConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseMediaMTX(string(text))
+	want := &mediamtx.Server{
+		Path: "/data/local/tmp/mc/mtx/mediamtx", Dir: "/data/local/tmp/mc/mtx",
+		Log: "/data/local/tmp/mc/mtx/mediamtx.log", RestartDelay: time.Second,
+	}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("parseMediaMTX = %+v, %v; want %+v", got, err, want)
+	}
+}
+
+func TestLoadHandsOverMediaMTX(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "multicam.toml")
+	config := "[mediamtx]\npath = \"/x/mediamtx\"\n[[camera]]\nname = \"p\"\nkind = \"blackmagic\"\naddress = \"127.0.0.1:1\"\n"
+	if err := os.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Load(path)
+	if err != nil || r.MediaMTX == nil || r.MediaMTX.Path != "/x/mediamtx" {
+		t.Errorf("Load = %+v, %v; want a rig with MediaMTX at /x/mediamtx", r, err)
 	}
 }

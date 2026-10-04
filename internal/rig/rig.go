@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"time"
@@ -17,13 +18,16 @@ import (
 
 	"github.com/cehbz/multicam/internal/blackmagic"
 	"github.com/cehbz/multicam/internal/console"
+	"github.com/cehbz/multicam/internal/mediamtx"
 	"github.com/cehbz/multicam/internal/sony"
 )
 
 // Rig is the cameras the server knows, in config order, each under its name
-// and ready for the console.
+// and ready for the console, and the MediaMTX to run beside them (nil when
+// the config names none).
 type Rig struct {
-	Cameras []console.Named
+	Cameras  []console.Named
+	MediaMTX *mediamtx.Server
 }
 
 // Load reads the rig from the TOML config file at path.
@@ -37,6 +41,9 @@ func Load(path string) (*Rig, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	rig := &Rig{}
+	if rig.MediaMTX, err = parseMediaMTX(string(text)); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	for _, c := range cameras {
 		cam, err := c.Kind.open(c.Name)
 		if err != nil {
@@ -140,7 +147,8 @@ var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 // unique valid name and the settings of its kind.
 func parse(text string) ([]camera, error) {
 	var config struct {
-		Cameras []map[string]any `toml:"camera"`
+		Cameras  []map[string]any `toml:"camera"`
+		MediaMTX map[string]any   `toml:"mediamtx"` // read by parseMediaMTX
 	}
 	md, err := toml.Decode(text, &config)
 	if err != nil {
@@ -204,4 +212,44 @@ func parse(text string) ([]camera, error) {
 		cameras = append(cameras, c)
 	}
 	return cameras, nil
+}
+
+// mediaMTXRestartDelay is the wait before a MediaMTX that exited is started
+// again.
+const mediaMTXRestartDelay = time.Second
+
+// parseMediaMTX reads the config's [mediamtx] table: path (the executable,
+// required), dir (its working directory, the executable's directory when left
+// out) and log (its output file, mediamtx.log in dir when left out). It
+// returns nil when the config has no such table.
+func parseMediaMTX(text string) (*mediamtx.Server, error) {
+	var config struct {
+		MediaMTX map[string]any `toml:"mediamtx"`
+	}
+	if _, err := toml.Decode(text, &config); err != nil {
+		return nil, err
+	}
+	if config.MediaMTX == nil {
+		return nil, nil
+	}
+	s := &settings{keys: config.MediaMTX}
+	path, dir, log := s.take("path"), s.take("dir"), s.take("log")
+	if s.err == nil {
+		if unknown := slices.Sorted(maps.Keys(s.keys)); len(unknown) > 0 {
+			s.err = fmt.Errorf("unknown key %q", unknown[0])
+		}
+	}
+	if s.err != nil {
+		return nil, fmt.Errorf("mediamtx: %w", s.err)
+	}
+	if path == "" {
+		return nil, errors.New("mediamtx: no path")
+	}
+	if dir == "" {
+		dir = filepath.Dir(path)
+	}
+	if log == "" {
+		log = filepath.Join(dir, "mediamtx.log")
+	}
+	return &mediamtx.Server{Path: path, Dir: dir, Log: log, RestartDelay: mediaMTXRestartDelay}, nil
 }
