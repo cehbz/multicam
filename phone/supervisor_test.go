@@ -189,6 +189,33 @@ func TestSupervisorStopsAfterFiveQuickExitsAndPostsOnce(t *testing.T) {
 	}
 }
 
+// The supervisor's lines carry the time in the server's format and zone.
+func TestSupervisorLogLinesAreTimestamped(t *testing.T) {
+	s := newSupDir(t, "")
+	if !exits(s.start(), 10*time.Second) {
+		t.Fatal("the supervisor never gave up")
+	}
+	var lines []string
+	for l := range strings.SplitSeq(s.read("multicam.log"), "\n") {
+		if strings.Contains(l, "supervisor: ") {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) != 6 {
+		t.Fatalf("%d supervisor lines, want 5 exits and the stop: %q", len(lines), lines)
+	}
+	for _, l := range lines {
+		stamp, _, ok := strings.Cut(l, " supervisor: ")
+		at, err := time.Parse("2006/01/02 15:04:05", stamp)
+		if !ok || err != nil {
+			t.Fatalf("line %q does not start with the time", l)
+		}
+		if d := time.Since(at); d < -time.Second || d > time.Minute {
+			t.Errorf("line %q is %v from now in UTC, the server's zone", l, d)
+		}
+	}
+}
+
 func TestSupervisorResetsTheCountAfterALongRun(t *testing.T) {
 	s := newSupDir(t, "q\nq\nq\nq\nl\n")
 	sup := s.start()

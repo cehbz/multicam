@@ -38,7 +38,8 @@ echo $$ >"$PIDFILE"
 
 pid=
 count=0
-log() { echo "supervisor: $*" >>"$LOG"; }
+# The time is in the server's format and zone (UTC), so the lines interleave.
+log() { echo "$(date -u '+%Y/%m/%d %H:%M:%S') supervisor: $*" >>"$LOG"; }
 trap 'count=0' USR1
 trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; exit 0' TERM INT
 trap '[ "$(cat "$PIDFILE" 2>/dev/null)" = $$ ] && rm -f "$PIDFILE"' EXIT
