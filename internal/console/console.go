@@ -263,12 +263,13 @@ var pageHTML string
 var page = template.Must(template.New("page").Parse(pageHTML))
 
 // New returns the console's handler for cameras, watching each camera's state
-// until ctx ends: the page at / and the liveview of the relayed camera a path
-// names as MJPEG at /{camera}/liveview. Each viewer of a picture gets its own
-// liveview session, closed when the viewer's request ends. For the page's
-// script, GET /events pushes every camera's state and then each change as
-// server-sent events, POST /start and POST /stop start and stop them all, and
-// POST /{camera}/start and /{camera}/stop one.
+// until ctx ends: the page at /, never cached, the files that install it as
+// an app, and the liveview of the relayed camera a path names as MJPEG at
+// /{camera}/liveview. Each viewer of a picture gets its own liveview session,
+// closed when the viewer's request ends. For the page's script, GET /events
+// pushes every camera's state and then each change as server-sent events,
+// POST /start and POST /stop start and stop them all, and POST
+// /{camera}/start and /{camera}/stop one.
 func New(ctx context.Context, cameras []Named) http.Handler {
 	c := newConsole(ctx, cameras)
 	// named serves a route of the camera its path names; 404 when none has
@@ -285,8 +286,10 @@ func New(ctx context.Context, cameras []Named) http.Handler {
 	}
 
 	mux := http.NewServeMux()
+	serveApp(mux)
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		page.Execute(w, struct {
 			Cameras  []Named
 			WHEPPort string

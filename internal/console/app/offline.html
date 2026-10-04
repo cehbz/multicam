@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>multicam</title>
+<style>
+html, body { height: 100%; margin: 0 }
+body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; background: #000; color: #fff; font: 13px/1.3 system-ui, sans-serif }
+p { margin: 0 }
+.retry { color: #888 }
+</style>
+<p>The multicam server is not running.</p>
+<p class="retry">Trying it every 2 s.</p>
+<script>
+// The server is asked for this page every 2 s; once it answers, the page is
+// loaded from it.
+function probe() {
+	fetch(location.href, {cache: 'no-store'}).then(() => location.reload(), () => setTimeout(probe, 2000));
+}
+setTimeout(probe, 2000);
+</script>
