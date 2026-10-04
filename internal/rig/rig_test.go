@@ -15,6 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
+
+	"github.com/cehbz/multicam/internal/blackmagic"
 	"github.com/cehbz/multicam/internal/console"
 	"github.com/cehbz/multicam/internal/link"
 	"github.com/cehbz/multicam/internal/mediamtx"
@@ -219,8 +223,9 @@ func TestLoadGivesEachCameraItsOwnBody(t *testing.T) {
 	}
 }
 
-// receive is the next state ch delivers, failing when none comes in a second.
-func receive(t *testing.T, ch <-chan bool) bool {
+// receive is the next status ch delivers, failing when none comes in a
+// second.
+func receive(t *testing.T, ch <-chan console.Status) console.Status {
 	t.Helper()
 	select {
 	case v, ok := <-ch:
@@ -229,11 +234,13 @@ func receive(t *testing.T, ch <-chan bool) bool {
 		}
 		return v
 	case <-time.After(time.Second):
-		t.Fatal("no state delivered")
-		return false
+		t.Fatal("no status delivered")
+		return console.Status{}
 	}
 }
 
+// A Sony body's picture, which the console relays, can be played whenever
+// the body is watched.
 func TestSonyBodyIsRecordingWhileItsStatusIsMovieRecording(t *testing.T) {
 	fake := sonytest.NewCamera(t)
 	cam, err := sonyBody{Endpoint: fake.Endpoint()}.open("body", noKeeper)
@@ -246,16 +253,16 @@ func TestSonyBodyIsRecordingWhileItsStatusIsMovieRecording(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := receive(t, ch); got {
-		t.Errorf("IDLE body's state %v, want not recording", got)
+	if got, want := receive(t, ch), (console.Status{Picture: true}); got != want {
+		t.Errorf("IDLE body's status %+v, want %+v", got, want)
 	}
 	for _, c := range []struct {
-		status string
-		want   bool
+		status    string
+		recording bool
 	}{{"MovieWaitRecStart", false}, {"MovieRecording", true}, {"MovieWaitRecStop", false}, {"MovieSaving", false}, {"IDLE", false}} {
 		fake.Push(c.status)
-		if got := receive(t, ch); got != c.want {
-			t.Errorf("state on %s %v, want %v", c.status, got, c.want)
+		if got, want := receive(t, ch), (console.Status{Recording: c.recording, Picture: true}); got != want {
+			t.Errorf("status on %s %+v, want %+v", c.status, got, want)
 		}
 	}
 	cancel()
@@ -286,6 +293,54 @@ func TestBlackmagicPhoneIsStreamedUnderItsName(t *testing.T) {
 	}
 	if cam.Name != "pixel9" || cam.Camera == nil || cam.Link != nil {
 		t.Errorf("camera %#v, want pixel9 with a camera and no link", cam)
+	}
+}
+
+// phoneApp is Blackmagic Camera's HTTP server as a watch uses it: idle, and
+// pushing each of statuses as its livestream's status once subscribed.
+func phoneApp(t *testing.T, statuses ...string) string {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch strings.TrimPrefix(r.URL.Path, blackmagic.BasePath) {
+		case blackmagic.RecordPath:
+			fmt.Fprint(w, `{"recording": false}`)
+		case blackmagic.EventPath:
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+			for _, s := range statuses {
+				wsjson.Write(r.Context(), conn, map[string]any{"type": "event", "data": map[string]any{
+					"action": "propertyValueChanged", "property": blackmagic.LivestreamPath, "value": map[string]any{"status": s}}})
+			}
+			conn.Read(r.Context())
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "https://")
+}
+
+func TestBlackmagicPhonesPictureCanBePlayedWhileItStreams(t *testing.T) {
+	cam, err := blackmagicPhone{Address: phoneApp(t, "Connecting", "Streaming", "Idle")}.open("pixel9", noKeeper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ch, err := cam.Watch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []console.Status{{}, {Picture: true}, {}} {
+		if got := receive(t, ch); got != want {
+			t.Errorf("status %d %+v, want %+v", i, got, want)
+		}
 	}
 }
 

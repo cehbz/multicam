@@ -64,13 +64,21 @@ type Streamed struct{ Path string }
 
 func (s Streamed) Stream() string { return s.Path }
 
-// Camera is what the console needs of a camera.
+// Status is a camera's status as its watch delivers it: whether it is
+// recording, and whether its picture can be played.
+type Status struct {
+	Recording bool
+	Picture   bool
+}
+
+// Camera is what the console needs of a camera. The page plays its picture
+// only while its watch says the picture can be played.
 type Camera interface {
 	StartRecording(ctx context.Context) error
 	StopRecording(ctx context.Context) error
-	// Watch delivers whether the camera is recording: the current state
-	// first, then each change, until the source ends and the channel closes.
-	Watch(ctx context.Context) (<-chan bool, error)
+	// Watch delivers the camera's status: the current one first, then each
+	// change, until the source ends and the channel closes.
+	Watch(ctx context.Context) (<-chan Status, error)
 }
 
 // Named is a camera as the console shows it: under its name, which also keys
@@ -93,18 +101,20 @@ const (
 )
 
 // state is one camera's state as the page gets it: its connection, whether
-// it is recording (known only while connected), and the error of its last
-// try to connect or of a command.
+// it is recording and whether its picture can be played (both known only
+// while connected), and the error of its last try to connect or of a
+// command.
 type state struct {
 	Name       string    `json:"name"`
 	Connection connState `json:"connection"`
 	Recording  *bool     `json:"recording,omitempty"`
+	Picture    bool      `json:"picture,omitempty"`
 	Error      string    `json:"error,omitempty"`
 }
 
 // same reports whether s and o are the same state.
 func (s state) same(o state) bool {
-	if s.Name != o.Name || s.Connection != o.Connection || s.Error != o.Error || (s.Recording == nil) != (o.Recording == nil) {
+	if s.Name != o.Name || s.Connection != o.Connection || s.Picture != o.Picture || s.Error != o.Error || (s.Recording == nil) != (o.Recording == nil) {
 		return false
 	}
 	return s.Recording == nil || *s.Recording == *o.Recording
@@ -292,10 +302,11 @@ var page = template.Must(template.New("page").Parse(pageHTML))
 // names as MJPEG at /{camera}/liveview while the camera is connected. Each
 // viewer of a picture gets its own liveview session, closed when the
 // viewer's request or the camera's connection ends. For the page's script,
-// GET /events pushes the server's connection and every camera's state and
-// then each change as server-sent events; POST /connect and POST /disconnect
-// connect and disconnect the server; POST /start and POST /stop start and
-// stop every camera, and POST /{camera}/start and /{camera}/stop one.
+// GET /events pushes the server's connection and every camera's state, which
+// says whether its picture can be played, and then each change as server-sent
+// events; POST /connect and POST /disconnect connect and disconnect the
+// server; POST /start and POST /stop start and stop every camera, and POST
+// /{camera}/start and /{camera}/stop one.
 func New(ctx context.Context, cameras []Named, saved StateFile) http.Handler {
 	c := newConsole(ctx, cameras, saved)
 	// named serves a route of the camera its path names; 404 when none has

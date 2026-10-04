@@ -116,22 +116,22 @@ func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 	// camera's state and then each change.
 	events := events(t, base)
 	awaitEvent(t, events, `{"connection":"disconnected","connecting":false}`)
-	want := `{"connection":"connected","cameras":[{"name":"one","connection":"connected","recording":false},{"name":"two","connection":"connected","recording":false}]}` + "\n"
+	want := `{"connection":"connected","cameras":[{"name":"one","connection":"connected","recording":false,"picture":true},{"name":"two","connection":"connected","recording":false,"picture":true}]}` + "\n"
 	if got := body(http.Post(base+"/connect", "", nil)); got != want {
 		t.Errorf("Connect's answer %q, want %q", got, want)
 	}
-	awaitEvent(t, events, `{"name":"one","connection":"connected","recording":false}`, `{"name":"two","connection":"connected","recording":false}`)
+	awaitEvent(t, events, `{"name":"one","connection":"connected","recording":false,"picture":true}`, `{"name":"two","connection":"connected","recording":false,"picture":true}`)
 	if connected, err := r.State.Connected(); !connected || err != nil {
 		t.Errorf("saved state %v, %v; want Connected", connected, err)
 	}
 
 	// Start on the second camera alone: the report carries the state the
 	// console knew; the change arrives as an event once the body reports it.
-	if got, want := body(http.Post(base+"/two/start", "", nil)), `{"cameras":[{"name":"two","connection":"connected","recording":false}]}`+"\n"; got != want {
+	if got, want := body(http.Post(base+"/two/start", "", nil)), `{"cameras":[{"name":"two","connection":"connected","recording":false,"picture":true}]}`+"\n"; got != want {
 		t.Errorf("report of the second camera's start %q, want %q", got, want)
 	}
 	second.Push("MovieRecording")
-	awaitEvent(t, events, `{"name":"two","connection":"connected","recording":true}`)
+	awaitEvent(t, events, `{"name":"two","connection":"connected","recording":true,"picture":true}`)
 	if got, want := sonyFake.Calls(), []string{"getEvent@1.3", "getEvent@1.3+"}; !slices.Equal(got, want) {
 		t.Errorf("first camera's calls after the second's Start %v, want its watch alone, %v", got, want)
 	}

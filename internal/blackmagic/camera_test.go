@@ -27,9 +27,10 @@ type fake struct {
 	livestream string // status of /livestreams/0
 	fail       string // "METHOD path" answered with 500
 
-	// pushes are record states and streamPushes livestream statuses,
-	// delivered on the event socket after the subscribe request in that
-	// order; subscribed receives the subscribe request's JSON.
+	// pushes are record states and streamPushes livestream statuses, each
+	// with its own bitrate, delivered on the event socket after the
+	// subscribe request in that order; subscribed receives the subscribe
+	// request's JSON.
 	pushes       []bool
 	streamPushes []string
 	subscribed   chan json.RawMessage
@@ -99,9 +100,9 @@ func (f *fake) events(w http.ResponseWriter, r *http.Request) {
 		wsjson.Write(ctx, conn, map[string]any{"type": "event", "data": map[string]any{
 			"action": "propertyValueChanged", "property": RecordPath, "value": map[string]any{"recording": v}}})
 	}
-	for _, s := range f.streamPushes {
+	for i, s := range f.streamPushes {
 		wsjson.Write(ctx, conn, map[string]any{"type": "event", "data": map[string]any{
-			"action": "propertyValueChanged", "property": LivestreamPath, "value": map[string]any{"status": s, "bitrate": 0}}})
+			"action": "propertyValueChanged", "property": LivestreamPath, "value": map[string]any{"status": s, "bitrate": 1000 * i}}})
 	}
 	// Hold the socket open until the client goes away.
 	conn.Read(ctx)
@@ -189,19 +190,7 @@ func TestWatchDeliversRESTStateThenPushes(t *testing.T) {
 		t.Errorf("subscribe request %+v", sub)
 	}
 
-	var got []bool
-	for range 3 {
-		select {
-		case v, ok := <-ch:
-			if !ok {
-				t.Fatalf("channel closed after %v", got)
-			}
-			got = append(got, v)
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out after %v", got)
-		}
-	}
-	if want := []bool{true, false, true}; !slices.Equal(got, want) {
+	if got, want := receive(t, ch, 3), []State{{Recording: true}, {}, {Recording: true}}; !slices.Equal(got, want) {
 		t.Errorf("states %v, want %v", got, want)
 	}
 
@@ -214,6 +203,70 @@ func TestWatchDeliversRESTStateThenPushes(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("channel still open after cancel")
 	}
+}
+
+// receive is the next n states ch delivers, failing when they don't come in
+// 5 s.
+func receive(t *testing.T, ch <-chan State, n int) []State {
+	t.Helper()
+	var got []State
+	for range n {
+		select {
+		case v, ok := <-ch:
+			if !ok {
+				t.Fatalf("channel closed after %v", got)
+			}
+			got = append(got, v)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out after %v", got)
+		}
+	}
+	return got
+}
+
+// quiet fails when ch delivers a state within 200 ms.
+func quiet(t *testing.T, ch <-chan State) {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		if ok {
+			t.Errorf("state %v delivered, want none", v)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestWatchIsStreamingWhileTheLivestreamIsStreaming(t *testing.T) {
+	f := newFake(t)
+	f.recording = true
+	f.streamPushes = []string{"Streaming", "Idle", "Connecting", "Streaming"}
+	ch, err := NewCamera(f.Address()).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first state is read over REST, before any status is pushed.
+	want := []State{{Recording: true}, {Recording: true, Streaming: true}, {Recording: true}, {Recording: true, Streaming: true}}
+	if got := receive(t, ch, len(want)); !slices.Equal(got, want) {
+		t.Errorf("states %v, want %v", got, want)
+	}
+	quiet(t, ch)
+}
+
+// A running stream pushes its bitrate about once a second; a push that
+// changes neither the recording state nor streaming is not delivered.
+func TestWatchDeliversOnlyChanges(t *testing.T) {
+	f := newFake(t)
+	f.pushes = []bool{false, true, true}
+	f.streamPushes = []string{"Connecting", "Streaming", "Streaming", "Streaming", "Streaming"}
+	ch, err := NewCamera(f.Address()).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []State{{}, {Recording: true}, {Recording: true, Streaming: true}}
+	if got := receive(t, ch, len(want)); !slices.Equal(got, want) {
+		t.Errorf("states %v, want %v", got, want)
+	}
+	quiet(t, ch)
 }
 
 func TestWatchFailsWhenStateUnreadable(t *testing.T) {

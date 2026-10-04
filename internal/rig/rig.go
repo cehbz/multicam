@@ -139,27 +139,46 @@ func (l sonyLink) Join(ctx context.Context) (console.Joined, error) {
 
 func (l sonyLink) Leave(ctx context.Context) error { return l.keeper.Leave(ctx, l.config.Interface) }
 
-// sonyCamera is a Sony body as the console watches it: recording while its
-// status is MovieRecording.
-type sonyCamera struct{ *sony.Camera }
-
-func (c sonyCamera) Watch(ctx context.Context) (<-chan bool, error) {
-	statuses, err := c.Camera.Watch(ctx)
+// watch is a camera's watch as the console takes it: each delivery of
+// source's watch as status gives it, until that watch ends or ctx does.
+func watch[T any](ctx context.Context, source func(context.Context) (<-chan T, error), status func(T) console.Status) (<-chan console.Status, error) {
+	deliveries, err := source(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan bool)
+	ch := make(chan console.Status)
 	go func() {
 		defer close(ch)
-		for s := range statuses {
+		for d := range deliveries {
 			select {
-			case ch <- s == "MovieRecording":
+			case ch <- status(d):
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 	return ch, nil
+}
+
+// sonyCamera is a Sony body as the console watches it: recording while its
+// status is MovieRecording, its picture, which the console relays, playable
+// whenever it is watched.
+type sonyCamera struct{ *sony.Camera }
+
+func (c sonyCamera) Watch(ctx context.Context) (<-chan console.Status, error) {
+	return watch(ctx, c.Camera.Watch, func(s sony.Status) console.Status {
+		return console.Status{Recording: s == "MovieRecording", Picture: true}
+	})
+}
+
+// blackmagicCamera is a phone running Blackmagic Camera as the console
+// watches it: its picture playable while its livestream is streaming.
+type blackmagicCamera struct{ *blackmagic.Camera }
+
+func (c blackmagicCamera) Watch(ctx context.Context) (<-chan console.Status, error) {
+	return watch(ctx, c.Camera.Watch, func(s blackmagic.State) console.Status {
+		return console.Status{Recording: s.Recording, Picture: s.Streaming}
+	})
 }
 
 // blackmagicPhone is a phone running Blackmagic Camera (kind "blackmagic"):
@@ -171,7 +190,7 @@ type blackmagicPhone struct {
 
 func (p blackmagicPhone) open(name string, _ func() (*link.Keeper, error)) (console.Named, error) {
 	cam := blackmagic.NewCamera(p.Address)
-	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: cam}, nil
+	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: blackmagicCamera{cam}}, nil
 }
 
 // settings is the keys of one [[camera]] table. take removes the ones read;

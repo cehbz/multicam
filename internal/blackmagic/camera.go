@@ -29,9 +29,13 @@ const (
 	LivestreamStartPath = "/livestreams/0/start"
 )
 
-// StatusIdle is the livestream status when no stream is running; the others
-// (Connecting, Streaming, Flushing, Interrupted, Disconnecting) all mean one is.
-const StatusIdle = "Idle"
+// Livestream statuses: StatusIdle when no stream is running, StatusStreaming
+// when one reaches its platform; the others (Connecting, Flushing,
+// Interrupted, Disconnecting) mean one is running but not streaming.
+const (
+	StatusIdle      = "Idle"
+	StatusStreaming = "Streaming"
+)
 
 // Camera is one phone, reached at its HTTP server. The server's certificate
 // is self-signed, so it is not verified.
@@ -114,6 +118,13 @@ type livestream struct {
 	Status string `json:"status"`
 }
 
+// State is the camera's state as Watch delivers it: whether it is
+// recording, and whether its livestream is streaming.
+type State struct {
+	Recording bool
+	Streaming bool
+}
+
 // eventMessage is one message from the notification socket; only
 // propertyValueChanged events carry a value.
 type eventMessage struct {
@@ -125,12 +136,14 @@ type eventMessage struct {
 	} `json:"data"`
 }
 
-// Watch reports the recording state as the camera pushes it: the state read
-// over REST first, then each change from the notification socket. The channel
-// closes when ctx ends or the socket drops. While it watches, it starts the
-// livestream whenever its pushed status turns Idle; the app pushes the status
-// on subscribing, so a stream not running when the watch begins is started.
-func (c *Camera) Watch(ctx context.Context) (<-chan bool, error) {
+// Watch reports the camera's state as the camera pushes it: the recording
+// state read over REST, not streaming, first, then each change of either from
+// the notification socket. The livestream is streaming while its pushed
+// status is Streaming. The channel closes when ctx ends or the socket drops.
+// While it watches, it starts the livestream whenever its pushed status turns
+// Idle; the app pushes the status on subscribing, so a stream not running
+// when the watch begins is started.
+func (c *Camera) Watch(ctx context.Context) (<-chan State, error) {
 	conn, _, err := websocket.Dial(ctx, c.url("wss", EventPath), &websocket.DialOptions{HTTPClient: c.http})
 	if err != nil {
 		return nil, fmt.Errorf("event websocket: %w", err)
@@ -148,11 +161,11 @@ func (c *Camera) Watch(ctx context.Context) (<-chan bool, error) {
 		conn.CloseNow()
 		return nil, err
 	}
-	ch := make(chan bool)
+	ch := make(chan State)
 	go func() {
 		defer close(ch)
 		defer conn.CloseNow()
-		deliver := func(v bool) bool {
+		deliver := func(v State) bool {
 			select {
 			case ch <- v:
 				return true
@@ -160,7 +173,8 @@ func (c *Camera) Watch(ctx context.Context) (<-chan bool, error) {
 				return false
 			}
 		}
-		if !deliver(current) {
+		delivered := State{Recording: current}
+		if !deliver(delivered) {
 			return
 		}
 		status := ""
@@ -172,15 +186,14 @@ func (c *Camera) Watch(ctx context.Context) (<-chan bool, error) {
 			if m.Type != "event" || m.Data.Action != "propertyValueChanged" {
 				continue
 			}
+			next := delivered
 			switch m.Data.Property {
 			case RecordPath:
 				var r record
 				if err := json.Unmarshal(m.Data.Value, &r); err != nil {
 					continue
 				}
-				if !deliver(r.Recording) {
-					return
-				}
+				next.Recording = r.Recording
 			case LivestreamPath:
 				var ls livestream
 				if err := json.Unmarshal(m.Data.Value, &ls); err != nil {
@@ -192,6 +205,14 @@ func (c *Camera) Watch(ctx context.Context) (<-chan bool, error) {
 					}
 				}
 				status = ls.Status
+				next.Streaming = ls.Status == StatusStreaming
+			}
+			if next == delivered {
+				continue
+			}
+			delivered = next
+			if !deliver(delivered) {
+				return
 			}
 		}
 	}()

@@ -26,11 +26,11 @@ import (
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
 
-// feed is a camera whose recording state the test delivers: each Watch hands
+// feed is a camera whose status the test delivers: each Watch hands
 // out a fresh channel, sent on watched, that the test feeds and closes. The
 // watch ends, as a camera's does, when its context ends.
 type feed struct {
-	watched  chan chan bool
+	watched  chan chan Status
 	watchErr atomic.Pointer[error] // Watch fails with it when set
 	watches  atomic.Int32          // Watch calls
 	startErr error
@@ -42,11 +42,11 @@ type feed struct {
 	ctxs []context.Context // each successful Watch's context
 }
 
-func newFeed() *feed { return &feed{watched: make(chan chan bool, 8)} }
+func newFeed() *feed { return &feed{watched: make(chan chan Status, 8)} }
 
 func (f *feed) failWatch(err error) { f.watchErr.Store(&err) }
 
-func (f *feed) Watch(ctx context.Context) (<-chan bool, error) {
+func (f *feed) Watch(ctx context.Context) (<-chan Status, error) {
 	f.watches.Add(1)
 	if err := f.watchErr.Load(); err != nil {
 		return nil, *err
@@ -54,7 +54,7 @@ func (f *feed) Watch(ctx context.Context) (<-chan bool, error) {
 	f.mu.Lock()
 	f.ctxs = append(f.ctxs, ctx)
 	f.mu.Unlock()
-	in, out := make(chan bool), make(chan bool)
+	in, out := make(chan Status), make(chan Status)
 	f.watched <- in
 	go func() {
 		defer close(out)
@@ -96,7 +96,7 @@ func (f *feed) StopRecording(context.Context) error {
 
 // watch returns the channel of the feed's next Watch, failing after d; with
 // no d, failing unless the Watch already happened.
-func (f *feed) watch(t *testing.T, d time.Duration) chan bool {
+func (f *feed) watch(t *testing.T, d time.Duration) chan Status {
 	t.Helper()
 	if d == 0 {
 		select {
@@ -116,11 +116,11 @@ func (f *feed) watch(t *testing.T, d time.Duration) chan bool {
 	}
 }
 
-// deliver feeds the state and waits for the console to take it.
-func (f *feed) deliver(t *testing.T, ch chan bool, recording bool) {
+// deliver feeds the status and waits for the console to take it.
+func (f *feed) deliver(t *testing.T, ch chan Status, s Status) {
 	t.Helper()
 	select {
-	case ch <- recording:
+	case ch <- s:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the console did not take the state")
 	}
@@ -128,10 +128,10 @@ func (f *feed) deliver(t *testing.T, ch chan bool, recording bool) {
 
 // up waits for the console to watch the feed's camera and delivers its first
 // state, idle, which connects it.
-func up(t *testing.T, f *feed) chan bool {
+func up(t *testing.T, f *feed) chan Status {
 	t.Helper()
 	ch := f.watch(t, time.Second)
-	f.deliver(t, ch, false)
+	f.deliver(t, ch, Status{})
 	return ch
 }
 
@@ -565,6 +565,27 @@ func TestScriptRequestsAFailedFirstPictureOnceMore2sLater(t *testing.T) {
 	}
 }
 
+// A picture runs only while its camera's state says it can be played, the
+// flag taken from each state, absent as false.
+var (
+	pictureFlag = regexp.MustCompile(`t\.playable = s\.picture === true;`)
+	pictureRuns = regexp.MustCompile(`if \(!connected\(\) \|\| t\.connection !== 'connected' \|\| !t\.playable\) \{`)
+)
+
+func TestScriptRunsAPictureOnlyWhileItCanBePlayed(t *testing.T) {
+	_, _, console := twoCameras(t)
+	m := script.FindStringSubmatch(get(console, "/").Body.String())
+	if m == nil {
+		t.Fatal("page has no script")
+	}
+	if !pictureFlag.MatchString(m[1]) {
+		t.Errorf("script does not take the picture flag from each state: %q", m[1])
+	}
+	if !pictureRuns.MatchString(m[1]) {
+		t.Errorf("script does not stop a picture that cannot be played: %q", m[1])
+	}
+}
+
 var videoTag = regexp.MustCompile(`<video [^>]*>`)
 
 func TestStreamedTileIsVideoFedByWHEP(t *testing.T) {
@@ -851,10 +872,10 @@ func TestEventsSendTheConnectionAndEveryCamerasStateThenEachChange(t *testing.T)
 			`{"name":"front","connection":"connecting"}`,
 			`{"name":"side","connection":"connecting"}`)
 		fch, sch := f.watch(t, 0), s.watch(t, 0)
-		fch <- true
+		fch <- Status{Recording: true}
 		synctest.Wait()
 		assertLatest(t, events, `{"name":"front","connection":"connected","recording":true}`)
-		sch <- false
+		sch <- Status{}
 		synctest.Wait()
 		assertLatest(t, events,
 			`connection {"connection":"connected","connecting":false}`,
@@ -873,10 +894,44 @@ func TestEventsSendTheConnectionAndEveryCamerasStateThenEachChange(t *testing.T)
 			}
 		}
 		// A repeat of the current state is not a change.
-		sch <- false
-		fch <- false
+		sch <- Status{}
+		fch <- Status{}
 		synctest.Wait()
 		assertLatest(t, events, `{"name":"front","connection":"connected","recording":false}`)
+	})
+}
+
+// A camera's state carries whether its picture can be played while it is
+// connected, and a change of that alone is a change.
+func TestEventsCarryWhetherThePictureCanBePlayed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cam, f := fed("cam")
+		console := New(t.Context(), []Named{cam}, saved(t, true))
+		synctest.Wait()
+		ch := f.watch(t, 0)
+		ch <- Status{}
+		synctest.Wait()
+
+		events := stream(t, console)
+		synctest.Wait()
+		assertLatest(t, events,
+			`connection {"connection":"connected","connecting":false}`,
+			`{"name":"cam","connection":"connected","recording":false}`)
+		ch <- Status{Picture: true}
+		synctest.Wait()
+		assertLatest(t, events, `{"name":"cam","connection":"connected","recording":false,"picture":true}`)
+		ch <- Status{Recording: true, Picture: true}
+		synctest.Wait()
+		assertLatest(t, events, `{"name":"cam","connection":"connected","recording":true,"picture":true}`)
+		ch <- Status{Recording: true}
+		synctest.Wait()
+		assertLatest(t, events, `{"name":"cam","connection":"connected","recording":true}`)
+		ch <- Status{Recording: true, Picture: true}
+		synctest.Wait()
+		f.failWatch(errors.New("event websocket: connection refused"))
+		close(ch)
+		synctest.Wait()
+		assertLatest(t, events, `{"name":"cam","connection":"disconnected","error":"event websocket: connection refused"}`)
 	})
 }
 
@@ -925,7 +980,7 @@ func TestEventsKeepTheStreamAliveEvery15s(t *testing.T) {
 		cam, f := fed("cam")
 		console := New(t.Context(), []Named{cam}, saved(t, true))
 		ch := f.watch(t, time.Second)
-		ch <- false
+		ch <- Status{}
 		synctest.Wait()
 
 		pr, pw := io.Pipe()
@@ -972,8 +1027,8 @@ func TestStartAllStartsTheCamerasNotRecording(t *testing.T) {
 		g.failWatch(errors.New("getEvent: connection refused"))
 		console := New(t.Context(), []Named{front, side, gone}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
-		fch <- true
-		sch <- false
+		fch <- Status{Recording: true}
+		sch <- Status{}
 		synctest.Wait()
 
 		states := ask(t, console, http.MethodPost, "/start")
@@ -988,7 +1043,7 @@ func TestStartAllStartsTheCamerasNotRecording(t *testing.T) {
 				f.starts.Load(), s.starts.Load(), g.starts.Load())
 		}
 		// The side camera's change is reported once it arrives.
-		sch <- true
+		sch <- Status{Recording: true}
 		synctest.Wait()
 		if got, want := summary(ask(t, console, http.MethodPost, "/start")), "front=recording side=recording gone=off!"; got != want {
 			t.Errorf("report %q, want %q", got, want)
@@ -1005,8 +1060,8 @@ func TestStopAllStopsTheCamerasNotIdle(t *testing.T) {
 		side, s := fed("side")
 		console := New(t.Context(), []Named{front, side}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
-		fch <- true
-		sch <- false
+		fch <- Status{Recording: true}
+		sch <- Status{}
 		synctest.Wait()
 
 		if got, want := summary(ask(t, console, http.MethodPost, "/stop")), "front=recording side=idle"; got != want {
@@ -1025,8 +1080,8 @@ func TestOneCamerasRefusalIsItsOwnError(t *testing.T) {
 		s.startErr = errors.New("startMovieRec: camera error 40401 (Camera Not Ready)")
 		console := New(t.Context(), []Named{front, side}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
-		fch <- false
-		sch <- false
+		fch <- Status{}
+		sch <- Status{}
 		synctest.Wait()
 		var logged bytes.Buffer
 		defer log.SetOutput(log.Writer())
@@ -1054,14 +1109,14 @@ func TestOneCamerasCommand(t *testing.T) {
 		side, s := fed("side")
 		console := New(t.Context(), []Named{front, side}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
-		fch <- false
-		sch <- false
+		fch <- Status{}
+		sch <- Status{}
 		synctest.Wait()
 
 		if got, want := summary(ask(t, console, http.MethodPost, "/side/start")), "side=idle"; got != want {
 			t.Errorf("start: report %q, want %q", got, want)
 		}
-		sch <- true
+		sch <- Status{Recording: true}
 		synctest.Wait()
 		if got, want := summary(ask(t, console, http.MethodPost, "/side/start")), "side=recording"; got != want {
 			t.Errorf("start again: report %q, want %q", got, want)
@@ -1091,7 +1146,7 @@ func TestRefusedStopKeepsTheCamerasState(t *testing.T) {
 		f.stopErr = errors.New("stopMovieRec: camera error 40401 (Camera Not Ready): Not <b>Ready</b>")
 		console := New(t.Context(), []Named{cam}, saved(t, true))
 		ch := f.watch(t, time.Second)
-		ch <- true
+		ch <- Status{Recording: true}
 		synctest.Wait()
 
 		states := ask(t, console, http.MethodPost, "/cam/stop")
@@ -1118,9 +1173,9 @@ func (c *timed) wait() error {
 	return c.err
 }
 
-func (c *timed) Watch(ctx context.Context) (<-chan bool, error) {
-	ch := make(chan bool, 1)
-	ch <- false
+func (c *timed) Watch(ctx context.Context) (<-chan Status, error) {
+	ch := make(chan Status, 1)
+	ch <- Status{}
 	context.AfterFunc(ctx, func() { close(ch) })
 	return ch, nil
 }

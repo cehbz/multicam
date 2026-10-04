@@ -98,15 +98,16 @@ function connected() { return server.intent ?? server.connected; }
 // A tile's state: its camera's connection, and as its error the try's error
 // or the connection when not connected; the camera's last known recording
 // status; what the last tap asked for while the camera has yet to agree (null
-// otherwise); the refusal of its last command; and its picture: the running
-// request (null when none), whether it failed, and whether the next request
-// is the first since the camera joined.
+// otherwise); the refusal of its last command; and its picture: whether the
+// camera's state says it can be played, the running request (null when
+// none), whether it failed, and whether the next request is the first since
+// it became playable.
 const tiles = new Map();
 for (const el of document.querySelectorAll('.tile')) {
 	const img = el.querySelector('img'), video = el.querySelector('video');
 	const t = {el, error: el.querySelector('.error'), connection: 'disconnected', fault: '', recording: false, intent: null, refusal: '',
 		picture: img ? relayed(img, img.dataset.liveview) : streamed(video, 'http://' + location.hostname + video.dataset.whep),
-		run: null, failed: false, first: true};
+		playable: false, run: null, failed: false, first: true};
 	tiles.set(el.dataset.camera, t);
 	el.onclick = () => command('/' + encodeURIComponent(el.dataset.camera), [t], !shown(t));
 }
@@ -218,6 +219,7 @@ events.onmessage = e => {
 	t.connection = s.connection;
 	t.fault = s.connection === 'connected' ? '' : s.error || (s.connection === 'connecting' ? 'connecting' : 'not connected');
 	if (s.connection === 'connected') t.failed = false;
+	t.playable = s.picture === true;
 	if ('recording' in s) {
 		t.recording = s.recording;
 		if (t.intent === t.recording) t.intent = null;
@@ -225,13 +227,13 @@ events.onmessage = e => {
 	draw();
 };
 
-// show runs t's picture while its camera is connected and the server is
-// shown connected, and stops it otherwise. A picture not running is
-// requested afresh, unless it failed: the first request since the camera
-// joined is made again 2 s after it fails, and a later failure waits for the
-// camera's next report.
+// show runs t's picture while the server is shown connected, its camera is
+// connected and its state says the picture can be played, and stops it
+// otherwise. A picture not running is requested afresh, unless it failed:
+// the first request since it became playable is made again 2 s after it
+// fails, and a later failure waits for the camera's next report.
 function show(t) {
-	if (!connected() || t.connection !== 'connected') {
+	if (!connected() || t.connection !== 'connected' || !t.playable) {
 		if (t.run) t.picture.stop();
 		t.run = null;
 		t.failed = false;

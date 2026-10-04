@@ -376,7 +376,7 @@ func (n *connection) keep(session context.Context, cc *cameraConn) {
 // upCamera is a camera that is up: its link, if it has one, and its watch.
 type upCamera struct {
 	joined Joined             // nil without a link
-	states <-chan bool        // the watch's
+	states <-chan Status      // the watch's
 	end    context.CancelFunc // ends the watch
 }
 
@@ -395,7 +395,7 @@ func (u *upCamera) down() {
 var errWatchEnded = errors.New("watch ended")
 
 // try brings cc up once: its link joined, one join at a time, then its
-// watch started and its first state read.
+// watch started and its first status read.
 func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, error) {
 	u := &upCamera{}
 	if cc.Link != nil {
@@ -423,14 +423,14 @@ func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, er
 	}
 	u.states = states
 	select {
-	case recording, ok := <-states:
+	case st, ok := <-states:
 		if !ok {
 			u.down()
 			return nil, errWatchEnded
 		}
 		n.mu.Lock()
 		cc.live = live
-		n.set(cc, state{Connection: connected, Recording: &recording})
+		n.set(cc, state{Connection: connected, Recording: &st.Recording, Picture: st.Picture})
 		n.mu.Unlock()
 		return u, nil
 	case <-session.Done():
@@ -439,7 +439,7 @@ func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, er
 	}
 }
 
-// follow shows u's states until it drops, its link lost or its watch ended,
+// follow shows u's statuses until it drops, its link lost or its watch ended,
 // or the session ends, and returns why, with u down.
 func (n *connection) follow(session context.Context, cc *cameraConn, u *upCamera) error {
 	defer func() {
@@ -454,12 +454,12 @@ func (n *connection) follow(session context.Context, cc *cameraConn, u *upCamera
 	}
 	for {
 		select {
-		case recording, ok := <-u.states:
+		case st, ok := <-u.states:
 			if !ok {
 				return errWatchEnded
 			}
 			n.mu.Lock()
-			n.set(cc, state{Connection: connected, Recording: &recording})
+			n.set(cc, state{Connection: connected, Recording: &st.Recording, Picture: st.Picture})
 			n.mu.Unlock()
 		case <-lost:
 			return u.joined.Err()

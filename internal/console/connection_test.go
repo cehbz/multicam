@@ -250,8 +250,8 @@ func TestSavedConnectedStartsConnected(t *testing.T) {
 		phone, pf := fed("phone")
 		console := New(t.Context(), []Named{body, phone}, saved(t, true))
 		synctest.Wait()
-		bf.watch(t, 0) <- true
-		pf.watch(t, 0) <- false
+		bf.watch(t, 0) <- Status{Recording: true}
+		pf.watch(t, 0) <- Status{}
 		synctest.Wait()
 		if joins, leaves := bl.counts(); joins != 1 || leaves != 0 {
 			t.Errorf("link: %d joins, %d leaves; want it joined once", joins, leaves)
@@ -300,11 +300,11 @@ func TestConnectJoinsTheLinksOneAtATimeAndWatchesEveryCamera(t *testing.T) {
 		if connected, _ := state.Connected(); !connected {
 			t.Error("saved state Disconnected during the Connect, want Connected")
 		}
-		pf.watch(t, 0) <- false // watched while the links join
+		pf.watch(t, 0) <- Status{} // watched while the links join
 		close(hold)
 		synctest.Wait()
-		af.watch(t, 0) <- false
-		bf.watch(t, 0) <- true
+		af.watch(t, 0) <- Status{}
+		bf.watch(t, 0) <- Status{Recording: true}
 		synctest.Wait()
 
 		rep := connectAnswer(t, answer)
@@ -334,7 +334,7 @@ func TestConnectGivesEachCameraOneTry(t *testing.T) {
 
 		answer := post(console, "/connect")
 		synctest.Wait()
-		cf.watch(t, 0) <- false
+		cf.watch(t, 0) <- Status{}
 		synctest.Wait()
 		rep := connectAnswer(t, answer)
 		if rep.Connection != connected || summary(rep.Cameras) != "a=off! b=off! c=idle" {
@@ -389,14 +389,14 @@ func TestConnectRetriesOnlyTheCamerasNotUp(t *testing.T) {
 
 		answer := post(console, "/connect")
 		synctest.Wait()
-		af.watch(t, 0) <- false
+		af.watch(t, 0) <- Status{}
 		synctest.Wait()
 		if got := summary(connectAnswer(t, answer).Cameras); got != "a=idle b=off!" {
 			t.Fatalf("first Connect: %q, want b off", got)
 		}
 		answer = post(console, "/connect")
 		synctest.Wait()
-		bf.watch(t, 0) <- false
+		bf.watch(t, 0) <- Status{}
 		synctest.Wait()
 		if got := summary(connectAnswer(t, answer).Cameras); got != "a=idle b=idle" {
 			t.Errorf("second Connect: %q, want both up", got)
@@ -423,7 +423,7 @@ func TestConnectDuringAConnectAddsNothing(t *testing.T) {
 		synctest.Wait()
 		close(hold)
 		synctest.Wait()
-		af.watch(t, 0) <- false
+		af.watch(t, 0) <- Status{}
 		synctest.Wait()
 		for i, answer := range []<-chan *httptest.ResponseRecorder{first, second} {
 			if rep := connectAnswer(t, answer); rep.Connection != connected || summary(rep.Cameras) != "a=idle" {
@@ -447,7 +447,7 @@ func TestDisconnectDuringAConnectWins(t *testing.T) {
 
 		answer := post(console, "/connect")
 		synctest.Wait()
-		bf.watch(t, 0) <- true
+		bf.watch(t, 0) <- Status{Recording: true}
 		synctest.Wait()
 		d := disconnect(t, console)
 		if d.Connection != disconnected || !slices.Equal(d.Recording, []string{"b"}) {
@@ -486,8 +486,8 @@ func TestDisconnectSavesFirstThenEndsTheWatchesAndLeaves(t *testing.T) {
 		}
 		console := New(t.Context(), []Named{a, b, c}, state)
 		synctest.Wait()
-		af.watch(t, 0) <- true
-		bf.watch(t, 0) <- false
+		af.watch(t, 0) <- Status{Recording: true}
+		bf.watch(t, 0) <- Status{}
 		synctest.Wait()
 
 		d := disconnect(t, console)
@@ -518,8 +518,8 @@ func TestADroppedLinkGetsOneTryToComeBack(t *testing.T) {
 		b, bf := fed("b")
 		console := New(t.Context(), []Named{a, b}, saved(t, true))
 		synctest.Wait()
-		af.watch(t, 0) <- false
-		bf.watch(t, 0) <- false
+		af.watch(t, 0) <- Status{}
+		bf.watch(t, 0) <- Status{}
 		synctest.Wait()
 
 		al.last().lose(errors.New("wlan1: lost DIRECT-a: CTRL-EVENT-DISCONNECTED"))
@@ -540,14 +540,14 @@ func TestADroppedLinkGetsOneTryToComeBack(t *testing.T) {
 		// leaves it up.
 		answer := post(console, "/connect")
 		synctest.Wait()
-		af.watch(t, 0) <- false
+		af.watch(t, 0) <- Status{}
 		synctest.Wait()
 		if got := summary(connectAnswer(t, answer).Cameras); got != "a=idle b=idle" {
 			t.Errorf("Connect: %q, want a up again", got)
 		}
 		al.last().lose(errors.New("wlan1: lost DIRECT-a: CTRL-EVENT-DISCONNECTED"))
 		synctest.Wait()
-		af.watch(t, 0) <- true
+		af.watch(t, 0) <- Status{Recording: true}
 		synctest.Wait()
 		if _, cams := look(t, console); cams != "a=recording b=idle" {
 			t.Errorf("cameras %q, want a back up", cams)
@@ -564,13 +564,13 @@ func TestAWatchThatEndsGetsOneTryToComeBack(t *testing.T) {
 		console := New(t.Context(), []Named{b}, saved(t, true))
 		synctest.Wait()
 		ch := bf.watch(t, 0)
-		ch <- true
+		ch <- Status{Recording: true}
 		synctest.Wait()
 
 		close(ch)
 		synctest.Wait()
 		ch = bf.watch(t, 0)
-		ch <- true
+		ch <- Status{Recording: true}
 		synctest.Wait()
 		if _, cams := look(t, console); cams != "b=recording" {
 			t.Errorf("cameras %q, want b back up", cams)
