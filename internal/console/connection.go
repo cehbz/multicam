@@ -126,10 +126,11 @@ type connection struct {
 type cameraConn struct {
 	*watched
 	phase   connState
-	running bool            // its keep runs
-	done    chan struct{}   // closed when its keep returns
-	settled chan struct{}   // closed when its try ends; nil when not connecting
-	live    context.Context // ends with the camera's connection; nil when not connected
+	running bool          // its keep runs
+	done    chan struct{} // closed when its keep returns
+	settled chan struct{} // closed when its try ends; nil when not connecting
+	status  Status        // its watch's last, while connected
+	feed    *feed         // its relayed picture's feed this connection; nil until started
 }
 
 // attempt is a running Connect and, once done is closed, its report.
@@ -377,7 +378,8 @@ func (n *connection) keep(session context.Context, cc *cameraConn) {
 type upCamera struct {
 	joined Joined             // nil without a link
 	states <-chan Status      // the watch's
-	end    context.CancelFunc // ends the watch
+	live   context.Context    // ends with the camera's connection
+	end    context.CancelFunc // ends the watch and live
 }
 
 // down ends u's watch, waiting for its channel to close, and closes its
@@ -412,7 +414,7 @@ func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, er
 		u.joined = joined
 	}
 	live, end := context.WithCancel(session)
-	u.end = end
+	u.live, u.end = live, end
 	states, err := cc.Watch(live)
 	if err != nil {
 		end()
@@ -429,8 +431,7 @@ func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, er
 			return nil, errWatchEnded
 		}
 		n.mu.Lock()
-		cc.live = live
-		n.set(cc, state{Connection: connected, Recording: &st.Recording, Picture: st.Picture})
+		n.take(cc, u.live, st)
 		n.mu.Unlock()
 		return u, nil
 	case <-session.Done():
@@ -440,13 +441,17 @@ func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, er
 }
 
 // follow shows u's statuses until it drops, its link lost or its watch ended,
-// or the session ends, and returns why, with u down.
+// or the session ends, and returns why, with u down and its feed ended.
 func (n *connection) follow(session context.Context, cc *cameraConn, u *upCamera) error {
 	defer func() {
-		n.mu.Lock()
-		cc.live = nil
-		n.mu.Unlock()
 		u.down()
+		n.mu.Lock()
+		f := cc.feed
+		cc.feed = nil
+		n.mu.Unlock()
+		if f != nil {
+			<-f.ended
+		}
 	}()
 	var lost <-chan struct{}
 	if u.joined != nil {
@@ -459,7 +464,7 @@ func (n *connection) follow(session context.Context, cc *cameraConn, u *upCamera
 				return errWatchEnded
 			}
 			n.mu.Lock()
-			n.set(cc, state{Connection: connected, Recording: &st.Recording, Picture: st.Picture})
+			n.take(cc, u.live, st)
 			n.mu.Unlock()
 		case <-lost:
 			return u.joined.Err()
@@ -467,6 +472,35 @@ func (n *connection) follow(session context.Context, cc *cameraConn, u *upCamera
 			return session.Err()
 		}
 	}
+}
+
+// take shows st, a status of cc's watch, and starts the feed of a relayed
+// picture for live, cc's connection, the first time st says its liveview can
+// start. Called with n.mu held.
+func (n *connection) take(cc *cameraConn, live context.Context, st Status) {
+	cc.status = st
+	if r, ok := cc.Picture.(Relayed); ok && st.Picture && cc.feed == nil {
+		f := newFeed()
+		cc.feed = f
+		go f.run(live, cc.Name, r.Source, func() {
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			if cc.feed == f {
+				n.showUp(cc)
+			}
+		})
+	}
+	n.showUp(cc)
+}
+
+// showUp shows cc connected with its watch's last status, a relayed picture
+// playable while its feed delivers frames. Called with n.mu held.
+func (n *connection) showUp(cc *cameraConn) {
+	st := cc.status
+	if _, ok := cc.Picture.(Relayed); ok {
+		st.Picture = cc.feed != nil && cc.feed.delivering()
+	}
+	n.set(cc, state{Connection: connected, Recording: &st.Recording, Picture: st.Picture})
 }
 
 // set makes s cc's state, ending its try when s is not connecting. Called
@@ -493,15 +527,36 @@ func (n *connection) show() {
 	n.board.setServer(s)
 }
 
-// live is the context of w's connection, which ends with it; nil when w is
-// not connected.
-func (n *connection) live(w *watched) context.Context {
+// frames is a viewer's frames of w's feed, as the feed's frames gives them
+// for ctx; nil when the feed isn't running.
+func (n *connection) frames(w *watched, ctx context.Context) func() ([]byte, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, cc := range n.cams {
-		if cc.watched == w {
-			return cc.live
+		if cc.watched == w && cc.feed != nil {
+			return cc.feed.frames(ctx)
 		}
 	}
 	return nil
+}
+
+// wait returns once base has ended and every camera's connection with it.
+func (n *connection) wait() {
+	<-n.base.Done()
+	for {
+		n.mu.Lock()
+		var running []chan struct{}
+		for _, cc := range n.cams {
+			if cc.running {
+				running = append(running, cc.done)
+			}
+		}
+		n.mu.Unlock()
+		if len(running) == 0 {
+			return
+		}
+		for _, done := range running {
+			<-done
+		}
+	}
 }

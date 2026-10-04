@@ -145,8 +145,8 @@ func (j *fakeJoined) lose(err error) {
 }
 
 // linked returns a camera under name with a link of its own, its state fed by
-// the returned feed.
-func linked(name string) (Named, *feed, *fakeLink) {
+// the returned script.
+func linked(name string) (Named, *scripted, *fakeLink) {
 	cam, f := fed(name)
 	l := &fakeLink{}
 	cam.Link = l
@@ -504,7 +504,7 @@ func TestDisconnectSavesFirstThenEndsTheWatchesAndLeaves(t *testing.T) {
 		if server, cams := look(t, console); server != isDisconnected || cams != "a=off b=off c=off" {
 			t.Errorf("server %+v, cameras %q; want Disconnected, every camera off", server, cams)
 		}
-		if a.Camera.(*feed).stops.Load() != 0 {
+		if a.Camera.(*scripted).stops.Load() != 0 {
 			t.Error("Disconnect stopped a camera's recording")
 		}
 	})
@@ -607,7 +607,7 @@ func TestCommandsWhileDisconnectedCommandNoCamera(t *testing.T) {
 	})
 }
 
-func TestLiveviewNeedsTheCameraConnectedAndEndsWithIt(t *testing.T) {
+func TestThePictureNeedsTheCameraConnectedAndEndsWithIt(t *testing.T) {
 	fake := sonytest.NewCamera(t)
 	cam, f := relayed(t, "cam", fake.Endpoint())
 	console := New(t.Context(), []Named{cam}, saved(t, false))
@@ -623,9 +623,13 @@ func TestLiveviewNeedsTheCameraConnectedAndEndsWithIt(t *testing.T) {
 	}
 
 	answer := post(console, "/connect")
-	up(t, f)
+	upPlayable(t, f)
 	if rep := connectAnswer(t, answer); rep.Connection != connected {
 		t.Fatalf("Connect: %+v", rep)
+	}
+	awaitPicture(t, console, "cam")
+	if got, want := fake.Calls(), []string{"startLiveview@1.0"}; !slices.Equal(got, want) {
+		t.Fatalf("camera calls once connected, before any viewer, %v; want %v", got, want)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()

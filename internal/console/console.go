@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -53,8 +54,8 @@ type Picture interface {
 	Stream() string
 }
 
-// Relayed is a picture the console relays: its source's liveview frames as
-// MJPEG at /{camera}/liveview.
+// Relayed is a picture the console relays: the frames of its camera's feed,
+// one liveview session of its source, as MJPEG at /{camera}/liveview.
 type Relayed struct{ Source Source[Liveview] }
 
 func (Relayed) Stream() string { return "" }
@@ -65,15 +66,14 @@ type Streamed struct{ Path string }
 func (s Streamed) Stream() string { return s.Path }
 
 // Status is a camera's status as its watch delivers it: whether it is
-// recording, and whether its picture can be played.
+// recording, and whether its picture can be played, which for a relayed
+// picture is whether its source's liveview can start.
 type Status struct {
 	Recording bool
 	Picture   bool
 }
 
-// Camera is what the console needs of a camera. The page requests its
-// picture when its watch says the picture can be played and stops it when the
-// watch says it can't.
+// Camera is what the console needs of a camera.
 type Camera interface {
 	StartRecording(ctx context.Context) error
 	StopRecording(ctx context.Context) error
@@ -104,7 +104,8 @@ const (
 // state is one camera's state as the page gets it: its connection, whether
 // it is recording and whether its picture can be played (both known only
 // while connected), and the error of its last try to connect or of a
-// command.
+// command. A streamed picture can be played while the camera's watch says
+// so, a relayed one while its feed delivers frames.
 type state struct {
 	Name       string    `json:"name"`
 	Connection connState `json:"connection"`
@@ -297,18 +298,27 @@ var pageHTML string
 // as the console pushes it.
 var page = template.Must(template.New("page").Parse(pageHTML))
 
-// New returns the console's handler for cameras, whose connection runs until
-// ctx ends and starts as saved says: the page at /, never cached, the files
-// that install it as an app, and the liveview of the relayed camera a path
-// names as MJPEG at /{camera}/liveview while the camera is connected. Each
-// viewer of a picture gets its own liveview session, closed when the
-// viewer's request or the camera's connection ends. For the page's script,
-// GET /events pushes the server's connection and every camera's state, which
-// says whether its picture can be played, and then each change as server-sent
-// events; POST /connect and POST /disconnect connect and disconnect the
-// server; POST /start and POST /stop start and stop every camera, and POST
-// /{camera}/start and /{camera}/stop one.
-func New(ctx context.Context, cameras []Named, saved StateFile) http.Handler {
+// Console is the console's handler and its connection to the cameras.
+type Console struct {
+	http.Handler
+	conn *connection
+}
+
+// Wait returns once the console's context has ended and every camera's
+// connection with it, their feeds' liveview sessions closed.
+func (c *Console) Wait() { c.conn.wait() }
+
+// New returns the console for cameras, whose connection runs until ctx ends
+// and starts as saved says. It serves the page at /, never cached, the files
+// that install it as an app, and the feed of the relayed camera a path names
+// as MJPEG at /{camera}/liveview while the feed runs; each viewer gets the
+// feed's latest frame, and a viewer leaving leaves the feed running. For the
+// page's script, GET /events pushes the server's connection and every
+// camera's state, which says whether its picture can be played, and then each
+// change as server-sent events; POST /connect and POST /disconnect connect
+// and disconnect the server; POST /start and POST /stop start and stop every
+// camera, and POST /{camera}/start and /{camera}/stop one.
+func New(ctx context.Context, cameras []Named, saved StateFile) *Console {
 	c := newConsole(ctx, cameras, saved)
 	// named serves a route of the camera its path names; 404 when none has
 	// the name.
@@ -334,27 +344,16 @@ func New(ctx context.Context, cameras []Named, saved StateFile) http.Handler {
 		}{cameras, whepPort})
 	})
 	mux.Handle("GET /{camera}/liveview", named(func(w http.ResponseWriter, r *http.Request, cam *watched) {
-		relayed, ok := cam.Picture.(Relayed)
-		if !ok {
+		if _, ok := cam.Picture.(Relayed); !ok {
 			http.NotFound(w, r)
 			return
 		}
-		live := c.conn.live(cam)
-		if live == nil {
-			http.Error(w, "not connected", http.StatusServiceUnavailable)
+		next := c.conn.frames(cam, r.Context())
+		if next == nil {
+			http.Error(w, "no picture", http.StatusServiceUnavailable)
 			return
 		}
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
-		defer context.AfterFunc(live, cancel)()
-		lv, err := relayed.Source.Liveview(ctx)
-		if err != nil {
-			slog.Error("liveview", "camera", cam.Name, "err", err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer lv.Close()
-		relay(w, lv)
+		relay(w, next)
 	}))
 
 	// The page's script: the cameras together at the root, one camera under
@@ -378,7 +377,7 @@ func New(ctx context.Context, cameras []Named, saved StateFile) http.Handler {
 	mux.Handle("POST /{camera}/stop", named(func(w http.ResponseWriter, r *http.Request, cam *watched) {
 		answer(w, c.record(r.Context(), []*watched{cam}, false))
 	}))
-	return mux
+	return &Console{Handler: mux, conn: c.conn}
 }
 
 // keepAlive is how often an idle event stream carries a comment.
@@ -437,14 +436,15 @@ func answer(w http.ResponseWriter, r any) {
 	json.NewEncoder(w).Encode(r)
 }
 
-// relay writes each JPEG frame of lv as one part of a multipart/x-mixed-replace
-// response, flushed per frame, until lv or the viewer ends.
-func relay(w http.ResponseWriter, lv Liveview) {
+// relay writes each JPEG frame next yields as one part of a
+// multipart/x-mixed-replace response, flushed per frame, until next fails or
+// the viewer ends.
+func relay(w http.ResponseWriter, next func() ([]byte, error)) {
 	parts := multipart.NewWriter(w)
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+parts.Boundary())
 	flusher := http.NewResponseController(w)
 	for {
-		jpeg, err := lv.Next()
+		jpeg, err := next()
 		if err != nil {
 			return
 		}
@@ -457,6 +457,110 @@ func relay(w http.ResponseWriter, lv Liveview) {
 		}
 		if err := flusher.Flush(); err != nil {
 			return
+		}
+	}
+}
+
+// errFeedEnded ends a viewer's frames when its feed ends.
+var errFeedEnded = errors.New("feed ended")
+
+// feed is a relayed camera's picture while the camera is connected: one
+// session of its source's liveview, whose frames every viewer shares. It runs
+// until the camera's connection ends or the source ends the session.
+type feed struct {
+	ended chan struct{} // closed once the feed has stopped and its session is closed
+
+	mu      sync.Mutex
+	frame   []byte        // the latest frame; nil before the first
+	fresh   chan struct{} // closed when a newer frame arrives or the feed stops
+	stopped bool
+}
+
+func newFeed() *feed { return &feed{ended: make(chan struct{}), fresh: make(chan struct{})} }
+
+// run starts src's liveview for ctx, the camera's connection, and takes its
+// frames until ctx or the session ends, then closes the session. changed is
+// called when the feed starts delivering frames and when it stops.
+func (f *feed) run(ctx context.Context, name string, src Source[Liveview], changed func()) {
+	defer close(f.ended)
+	lv, err := src.Liveview(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Error("liveview", "camera", name, "err", err)
+		}
+		f.stop()
+		return
+	}
+	for {
+		jpeg, err := lv.Next()
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("liveview ended", "camera", name, "err", err)
+			}
+			break
+		}
+		f.mu.Lock()
+		first := f.frame == nil
+		f.frame = jpeg
+		close(f.fresh)
+		f.fresh = make(chan struct{})
+		f.mu.Unlock()
+		if first {
+			changed()
+		}
+	}
+	if f.stop() {
+		changed()
+	}
+	if err := lv.Close(); err != nil {
+		slog.Error("liveview close", "camera", name, "err", err)
+	}
+}
+
+// stop stops the feed and reports whether it was delivering frames.
+func (f *feed) stop() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = true
+	close(f.fresh)
+	return f.frame != nil
+}
+
+// delivering reports whether the feed delivers frames: it has one and has
+// not stopped.
+func (f *feed) delivering() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.frame != nil && !f.stopped
+}
+
+// frames returns a viewer's frames: each call yields the latest frame the
+// viewer hasn't had, waiting for one, until the feed stops or ctx ends. Nil
+// once the feed has stopped.
+func (f *feed) frames(ctx context.Context) func() ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopped {
+		return nil
+	}
+	var seen chan struct{} // fresh as it was when the viewer got its last frame
+	return func() ([]byte, error) {
+		for {
+			f.mu.Lock()
+			frame, fresh, stopped := f.frame, f.fresh, f.stopped
+			f.mu.Unlock()
+			if stopped {
+				return nil, errFeedEnded
+			}
+			if frame != nil && fresh != seen {
+				seen = fresh
+				return frame, nil
+			}
+			select {
+			case <-fresh:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 	}
 }

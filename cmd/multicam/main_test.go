@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -118,9 +119,10 @@ func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 	// camera's state and then each change.
 	events := events(t, base)
 	awaitEvent(t, events, `{"connection":"disconnected","connecting":false}`)
-	want := `{"connection":"connected","cameras":[{"name":"one","connection":"connected","recording":false,"picture":true},{"name":"two","connection":"connected","recording":false,"picture":true}]}` + "\n"
-	if got := body(http.Post(base+"/connect", "", nil)); got != want {
-		t.Errorf("Connect's answer %q, want %q", got, want)
+	// Each body's picture is playable once its feed delivers frames.
+	want := regexp.MustCompile(`^\{"connection":"connected","cameras":\[\{"name":"one","connection":"connected","recording":false(,"picture":true)?\},\{"name":"two","connection":"connected","recording":false(,"picture":true)?\}\]\}\n$`)
+	if got := body(http.Post(base+"/connect", "", nil)); !want.MatchString(got) {
+		t.Errorf("Connect's answer %q, want both cameras connected and idle", got)
 	}
 	awaitEvent(t, events, `{"name":"one","connection":"connected","recording":false,"picture":true}`, `{"name":"two","connection":"connected","recording":false,"picture":true}`)
 	if connected, err := r.State.Connected(); !connected || err != nil {
@@ -134,8 +136,8 @@ func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 	}
 	second.Push("MovieRecording")
 	awaitEvent(t, events, `{"name":"two","connection":"connected","recording":true,"picture":true}`)
-	if got, want := sonyFake.Calls(), []string{"getEvent@1.3", "getEvent@1.3+"}; !slices.Equal(got, want) {
-		t.Errorf("first camera's calls after the second's Start %v, want its watch alone, %v", got, want)
+	if got, want := slices.Sorted(slices.Values(sonyFake.Calls())), []string{"getEvent@1.3", "getEvent@1.3+", "startLiveview@1.0"}; !slices.Equal(got, want) {
+		t.Errorf("first camera's calls after the second's Start %v, want its watch and its picture's alone, %v", got, want)
 	}
 	if !slices.Contains(second.Calls(), "startMovieRec@1.0") {
 		t.Errorf("second camera's calls %v lack its start", second.Calls())
@@ -159,8 +161,8 @@ func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 		}
 	}
 
-	// Stopping with a viewer attached ends its liveview session before run
-	// returns.
+	// Stopping ends each body's liveview, with a viewer attached or none,
+	// before run returns.
 	cancel()
 	select {
 	case err := <-done:
@@ -170,8 +172,11 @@ func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("run still serving 5 s after its context ended")
 	}
-	if got, want := sonyFake.Calls(), []string{"getEvent@1.3", "getEvent@1.3+", "startLiveview@1.0", "stopLiveview@1.0"}; !slices.Equal(got, want) {
+	if got, want := slices.Sorted(slices.Values(sonyFake.Calls())), []string{"getEvent@1.3", "getEvent@1.3+", "startLiveview@1.0", "stopLiveview@1.0"}; !slices.Equal(got, want) {
 		t.Errorf("first camera's calls %v, want %v", got, want)
+	}
+	if calls := second.Calls(); !slices.Contains(calls, "stopLiveview@1.0") {
+		t.Errorf("second camera's calls %v lack its stopLiveview", calls)
 	}
 }
 
