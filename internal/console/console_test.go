@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -167,11 +168,29 @@ func awaitUp(t *testing.T, console http.Handler, names ...string) {
 	t.Fatalf("cameras %v not connected within 5 s", waiting)
 }
 
+// stateDir holds the tests' state files. A console saves its state after its
+// test ends, so the directory is removed once every test has.
+var stateDir string
+
+func TestMain(m *testing.M) {
+	var err error
+	if stateDir, err = os.MkdirTemp("", "console-test"); err != nil {
+		log.Fatal(err)
+	}
+	code := m.Run()
+	os.RemoveAll(stateDir)
+	os.Exit(code)
+}
+
 // saved returns a state file holding the connection state, Connected or
 // Disconnected.
 func saved(t *testing.T, connected bool) StateFile {
 	t.Helper()
-	f := StateFile(filepath.Join(t.TempDir(), "connection.state"))
+	dir, err := os.MkdirTemp(stateDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := StateFile(filepath.Join(dir, "connection.state"))
 	if err := f.Save(connected); err != nil {
 		t.Fatal(err)
 	}
