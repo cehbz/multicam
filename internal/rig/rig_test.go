@@ -2,6 +2,7 @@ package rig
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,10 +16,17 @@ import (
 	"time"
 
 	"github.com/cehbz/multicam/internal/console"
+	"github.com/cehbz/multicam/internal/link"
 	"github.com/cehbz/multicam/internal/mediamtx"
 	"github.com/cehbz/multicam/internal/sony"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
 )
+
+// onLink is a Sony body joined on iface to network with password, its
+// route in table.
+func onLink(iface, network, password string, table int) sonyBody {
+	return sonyBody{Interface: iface, Endpoint: sony.DefaultEndpoint, Network: network, Password: password, Table: table}
+}
 
 func TestParse(t *testing.T) {
 	tests := []struct {
@@ -28,14 +36,28 @@ func TestParse(t *testing.T) {
 		wantErr string // part of the error; empty when the config is valid
 	}{
 		{
-			name: "two Sony bodies on their interfaces",
-			text: "[[camera]]\nname = \"rx10m4\"\nkind = \"sony\"\ninterface = \"wlan1\"\n[[camera]]\nname = \"rx100m6\"\nkind = \"sony\"\ninterface = \"cam2\"\nstart_gap = \"3s\"\n",
-			want: []camera{{"rx10m4", sonyBody{"wlan1", sony.DefaultEndpoint, 0}}, {"rx100m6", sonyBody{"cam2", sony.DefaultEndpoint, 3 * time.Second}}},
+			name: "two Sony bodies on their links, each with its own table",
+			text: "[[camera]]\nname = \"rx10m4\"\nkind = \"sony\"\ninterface = \"wlan1\"\nnetwork = \"DIRECT-a\"\npassword = \"pa\"\n" +
+				"[[camera]]\nname = \"pixel9\"\nkind = \"blackmagic\"\naddress = \"192.168.1.9:4444\"\n" +
+				"[[camera]]\nname = \"rx100m6\"\nkind = \"sony\"\ninterface = \"cam2\"\nnetwork = \"DIRECT-b\"\npassword = \"pb\"\nstart_gap = \"3s\"\n",
+			want: []camera{
+				{"rx10m4", onLink("wlan1", "DIRECT-a", "pa", 2001)},
+				{"pixel9", blackmagicPhone{"192.168.1.9:4444"}},
+				{"rx100m6", func() sonyBody { b := onLink("cam2", "DIRECT-b", "pb", 2002); b.StartGap = 3 * time.Second; return b }()},
+			},
 		},
 		{
 			name: "Sony body with an endpoint and no interface",
 			text: "[[camera]]\nname = \"fake-1\"\nkind = \"sony\"\nendpoint = \"http://127.0.0.1:9/sony/camera\"\n",
-			want: []camera{{"fake-1", sonyBody{"", "http://127.0.0.1:9/sony/camera", 0}}},
+			want: []camera{{"fake-1", sonyBody{Endpoint: "http://127.0.0.1:9/sony/camera"}}},
+		},
+		{name: "interface without a network", text: "[[camera]]\nname = \"a\"\nkind = \"sony\"\ninterface = \"wlan1\"\npassword = \"p\"\n", wantErr: "camera 1 (a): a body on an interface needs its network and password"},
+		{name: "interface without a password", text: "[[camera]]\nname = \"a\"\nkind = \"sony\"\ninterface = \"wlan1\"\nnetwork = \"n\"\n", wantErr: "camera 1 (a): a body on an interface needs its network and password"},
+		{name: "network without an interface", text: "[[camera]]\nname = \"a\"\nkind = \"sony\"\nnetwork = \"n\"\npassword = \"p\"\n", wantErr: "camera 1 (a): network and password need an interface"},
+		{
+			name:    "two bodies on one interface",
+			text:    "[[camera]]\nname = \"a\"\nkind = \"sony\"\ninterface = \"wlan1\"\nnetwork = \"n\"\npassword = \"p\"\n[[camera]]\nname = \"b\"\nkind = \"sony\"\ninterface = \"wlan1\"\nnetwork = \"m\"\npassword = \"p\"\n",
+			wantErr: `camera 2 (b): interface "wlan1" is already camera 1's`,
 		},
 		{
 			name: "Blackmagic camera at its address",
@@ -77,32 +99,89 @@ func TestParse(t *testing.T) {
 			got, err := parse(tt.text)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("parse = %v, %v; want an error containing %q", got, err, tt.wantErr)
+					t.Fatalf("parse = %v, %v; want an error containing %q", got.cameras, err, tt.wantErr)
 				}
 				return
 			}
-			if err != nil || !slices.Equal(got, tt.want) {
-				t.Errorf("parse = %v, %v; want %v", got, err, tt.want)
+			if err != nil || !slices.Equal(got.cameras, tt.want) {
+				t.Errorf("parse = %v, %v; want %v", got.cameras, err, tt.want)
 			}
 		})
 	}
 }
 
-const phoneConfig = "../../multicam.phone.toml"
+const (
+	exampleConfig = "../../multicam.example.toml"
+	phoneConfig   = "../../multicam.phone.toml"
+)
 
-func TestPhoneConfig(t *testing.T) {
-	text, err := os.ReadFile(phoneConfig)
+// exampleCameras are the example config's cameras.
+var exampleCameras = []camera{
+	{"rx10m4", onLink("wlan1", "DIRECT-xxxx:DSC-RX10M4", "password", 2001)},
+	{"rx100m6", func() sonyBody {
+		b := onLink("cam2", "DIRECT-xxxx:DSC-RX100M6", "password", 2002)
+		b.StartGap = 3 * time.Second
+		return b
+	}()},
+	{"pixel9", blackmagicPhone{"192.168.1.109:4444"}},
+}
+
+func TestExampleConfig(t *testing.T) {
+	text, err := os.ReadFile(exampleConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, err := parse(string(text))
-	want := []camera{
-		{"rx10m4", sonyBody{"wlan1", sony.DefaultEndpoint, 0}},
-		{"rx100m6", sonyBody{"cam2", sony.DefaultEndpoint, 3 * time.Second}},
-		{"pixel9", blackmagicPhone{"192.168.1.109:4444"}},
+	if err != nil || !slices.Equal(got.cameras, exampleCameras) {
+		t.Errorf("parse = %v, %v; want %v", got.cameras, err, exampleCameras)
 	}
-	if err != nil || !slices.Equal(got, want) {
-		t.Errorf("parse = %v, %v; want %v", got, err, want)
+	want := &mediamtx.Server{
+		Path: "/data/local/tmp/mc/mtx/mediamtx", Dir: "/data/local/tmp/mc/mtx",
+		Log: "/data/local/tmp/mc/mtx/mediamtx.log", RestartDelay: time.Second,
+	}
+	if !reflect.DeepEqual(got.mediaMTX, want) {
+		t.Errorf("MediaMTX %+v, want %+v", got.mediaMTX, want)
+	}
+	if got.links != (link.Options{}) || got.state != "" {
+		t.Errorf("links %+v, state %q; want the defaults", got.links, got.state)
+	}
+}
+
+// The phone's config, which is not checked in, is the example with the
+// bodies' credentials.
+func TestPhoneConfigIsTheExampleWithCredentials(t *testing.T) {
+	text, err := os.ReadFile(phoneConfig)
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skip("no phone config")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parse(string(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cameras []camera
+	for _, c := range got.cameras {
+		if b, ok := c.Kind.(sonyBody); ok {
+			if b.Network == "" || strings.Contains(b.Network, "xxxx") || b.Password == "" || b.Password == "password" {
+				t.Errorf("camera %s: placeholder credentials", c.Name)
+			}
+			b.Network, b.Password = "", ""
+			c.Kind = b
+		}
+		cameras = append(cameras, c)
+	}
+	var want []camera
+	for _, c := range exampleCameras {
+		if b, ok := c.Kind.(sonyBody); ok {
+			b.Network, b.Password = "", ""
+			c.Kind = b
+		}
+		want = append(want, c)
+	}
+	if !slices.Equal(cameras, want) {
+		t.Errorf("cameras without credentials %v, want the example's %v", cameras, want)
 	}
 }
 
@@ -157,7 +236,7 @@ func receive(t *testing.T, ch <-chan bool) bool {
 
 func TestSonyBodyIsRecordingWhileItsStatusIsMovieRecording(t *testing.T) {
 	fake := sonytest.NewCamera(t)
-	cam, err := sonyBody{Endpoint: fake.Endpoint()}.open("body")
+	cam, err := sonyBody{Endpoint: fake.Endpoint()}.open("body", noKeeper)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +267,7 @@ func TestSonyBodyIsRecordingWhileItsStatusIsMovieRecording(t *testing.T) {
 func TestSonyBodyWatchFailureIsReturned(t *testing.T) {
 	gone := httptest.NewServer(http.NotFoundHandler())
 	gone.Close() // its address now refuses connections
-	cam, err := sonyBody{Endpoint: gone.URL + "/sony/camera"}.open("body")
+	cam, err := sonyBody{Endpoint: gone.URL + "/sony/camera"}.open("body", noKeeper)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,15 +277,15 @@ func TestSonyBodyWatchFailureIsReturned(t *testing.T) {
 }
 
 func TestBlackmagicPhoneIsStreamedUnderItsName(t *testing.T) {
-	cam, err := blackmagicPhone{Address: "192.168.1.9:4444"}.open("pixel9")
+	cam, err := blackmagicPhone{Address: "192.168.1.9:4444"}.open("pixel9", noKeeper)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := cam.Picture, (console.Streamed{Path: "pixel9"}); got != want {
 		t.Errorf("picture %#v, want %#v", got, want)
 	}
-	if cam.Name != "pixel9" || cam.Camera == nil {
-		t.Errorf("camera %#v, want pixel9 with a camera", cam)
+	if cam.Name != "pixel9" || cam.Camera == nil || cam.Link != nil {
+		t.Errorf("camera %#v, want pixel9 with a camera and no link", cam)
 	}
 }
 
@@ -228,72 +307,117 @@ func TestLoadOfInterfacesNeedsLinux(t *testing.T) {
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		t.Skip("this system binds connections to interfaces")
 	}
-	rig, err := Load(phoneConfig)
+	rig, err := Load(exampleConfig)
 	if err == nil || !strings.Contains(err.Error(), "rx10m4") || !strings.Contains(err.Error(), "wlan1") {
 		t.Errorf("Load = %v, %v; want an error naming camera rx10m4 and interface wlan1", rig, err)
 	}
 }
 
-func TestParseMediaMTX(t *testing.T) {
+func TestParseTables(t *testing.T) {
 	cam := "[[camera]]\nname = \"a\"\nkind = \"sony\"\n"
 	tests := []struct {
-		name    string
-		text    string
-		want    *mediamtx.Server
-		wantErr string
+		name     string
+		text     string
+		mediaMTX *mediamtx.Server
+		links    link.Options
+		state    string
+		wantErr  string
 	}{
-		{"none when the config does not name it", cam, nil, ""},
+		{name: "none: no MediaMTX and the defaults", text: cam},
 		{
-			"its path alone: its directory and a log in it",
-			"[mediamtx]\npath = \"/m/mtx/mediamtx\"\n" + cam,
-			&mediamtx.Server{Path: "/m/mtx/mediamtx", Dir: "/m/mtx", Log: "/m/mtx/mediamtx.log", RestartDelay: time.Second},
-			"",
+			name:     "MediaMTX's path alone: its directory and a log in it",
+			text:     "[mediamtx]\npath = \"/m/mtx/mediamtx\"\n" + cam,
+			mediaMTX: &mediamtx.Server{Path: "/m/mtx/mediamtx", Dir: "/m/mtx", Log: "/m/mtx/mediamtx.log", RestartDelay: time.Second},
 		},
 		{
-			"its directory and log",
-			"[mediamtx]\npath = \"/bin/mediamtx\"\ndir = \"/etc/m\"\nlog = \"/var/m.log\"\n" + cam,
-			&mediamtx.Server{Path: "/bin/mediamtx", Dir: "/etc/m", Log: "/var/m.log", RestartDelay: time.Second},
-			"",
+			name:     "MediaMTX's directory and log",
+			text:     "[mediamtx]\npath = \"/bin/mediamtx\"\ndir = \"/etc/m\"\nlog = \"/var/m.log\"\n" + cam,
+			mediaMTX: &mediamtx.Server{Path: "/bin/mediamtx", Dir: "/etc/m", Log: "/var/m.log", RestartDelay: time.Second},
 		},
-		{"no path", "[mediamtx]\ndir = \"/x\"\n" + cam, nil, "mediamtx: no path"},
-		{"unknown key", "[mediamtx]\npath = \"/x\"\nport = 1\n" + cam, nil, "port"},
-		{"path not a string", "[mediamtx]\npath = 3\n" + cam, nil, "mediamtx"},
+		{name: "MediaMTX without a path", text: "[mediamtx]\ndir = \"/x\"\n" + cam, wantErr: "mediamtx: no path"},
+		{name: "MediaMTX's unknown key", text: "[mediamtx]\npath = \"/x\"\nport = 1\n" + cam, wantErr: "port"},
+		{name: "MediaMTX's path not a string", text: "[mediamtx]\npath = 3\n" + cam, wantErr: "mediamtx"},
+		{
+			name:  "the links and the state file",
+			text:  "state = \"/s/connection\"\n[link]\nsupplicant = \"/w/wpa\"\nlib = \"/w/lib\"\ndir = \"/l\"\nphy = \"phy1\"\n" + cam,
+			links: link.Options{Supplicant: "/w/wpa", Lib: "/w/lib", Dir: "/l", Phy: "phy1"},
+			state: "/s/connection",
+		},
+		{name: "the links' unknown key", text: "[link]\nsocket = \"/x\"\n" + cam, wantErr: "unknown key link.socket"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseMediaMTX(tt.text)
+			got, err := parse(tt.text)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Errorf("parseMediaMTX = %v, %v; want an error with %q", got, err, tt.wantErr)
+					t.Errorf("parse = %+v, %v; want an error with %q", got, err, tt.wantErr)
 				}
 				return
 			}
-			if err != nil || !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("parseMediaMTX = %+v, %v; want %+v", got, err, tt.want)
+			if err != nil || !reflect.DeepEqual(got.mediaMTX, tt.mediaMTX) || got.links != tt.links || got.state != tt.state {
+				t.Errorf("parse = MediaMTX %+v, links %+v, state %q, %v; want %+v, %+v, %q",
+					got.mediaMTX, got.links, got.state, err, tt.mediaMTX, tt.links, tt.state)
 			}
 		})
 	}
 }
 
-func TestParseAcceptsTheMediaMTXTable(t *testing.T) {
-	text := "[mediamtx]\npath = \"/x/mediamtx\"\n[[camera]]\nname = \"a\"\nkind = \"sony\"\n"
-	if got, err := parse(text); err != nil || len(got) != 1 {
-		t.Errorf("parse = %v, %v; want the one camera", got, err)
+func TestLoadKeepsTheStateBesideTheConfigByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "multicam.toml")
+	if err := os.WriteFile(path, []byte("[[camera]]\nname = \"p\"\nkind = \"blackmagic\"\naddress = \"127.0.0.1:1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Load(path)
+	if err != nil || r.State != console.StateFile(filepath.Join(dir, "connection.state")) {
+		t.Errorf("Load = %+v, %v; want the state file connection.state beside the config", r, err)
 	}
 }
 
-func TestPhoneConfigRunsMediaMTXWhereRigShPutIt(t *testing.T) {
-	text, err := os.ReadFile(phoneConfig)
+// fakeKeeper records the links it is asked to join and leave.
+type fakeKeeper struct {
+	joined []link.Config
+	left   []string
+	err    error
+}
+
+func (k *fakeKeeper) Join(_ context.Context, c link.Config) (*link.Link, error) {
+	k.joined = append(k.joined, c)
+	return nil, k.err
+}
+
+func (k *fakeKeeper) Leave(_ context.Context, iface string) error {
+	k.left = append(k.left, iface)
+	return k.err
+}
+
+func TestSonyLinkIsTheBodysLinkOnTheKeeper(t *testing.T) {
+	k := &fakeKeeper{err: errors.New("cam2: not joined to DIRECT-b within 15s")}
+	cfg := link.Config{Interface: "cam2", Network: "DIRECT-b", Password: "pb", Table: 2002}
+	l := sonyLink{keeper: k, config: cfg}
+	if j, err := l.Join(t.Context()); j != nil || err != k.err {
+		t.Errorf("Join = %v, %v; want no link and the keeper's error", j, err)
+	}
+	if err := l.Leave(t.Context()); err != k.err {
+		t.Errorf("Leave = %v, want the keeper's error", err)
+	}
+	if !slices.Equal(k.joined, []link.Config{cfg}) || !slices.Equal(k.left, []string{"cam2"}) {
+		t.Errorf("keeper joined %v and left %v; want the body's link", k.joined, k.left)
+	}
+}
+
+func TestBodyOnAnInterfaceOpensWithItsLink(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+		t.Skip("binding to an interface needs Linux")
+	}
+	k := &link.Keeper{}
+	cam, err := onLink("cam2", "DIRECT-b", "pb", 2002).open("rx100m6", func() (*link.Keeper, error) { return k, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := parseMediaMTX(string(text))
-	want := &mediamtx.Server{
-		Path: "/data/local/tmp/mc/mtx/mediamtx", Dir: "/data/local/tmp/mc/mtx",
-		Log: "/data/local/tmp/mc/mtx/mediamtx.log", RestartDelay: time.Second,
-	}
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Errorf("parseMediaMTX = %+v, %v; want %+v", got, err, want)
+	want := sonyLink{keeper: k, config: link.Config{Interface: "cam2", Network: "DIRECT-b", Password: "pb", Table: 2002}}
+	if cam.Link != want {
+		t.Errorf("link %#v, want %#v", cam.Link, want)
 	}
 }
 
@@ -308,3 +432,6 @@ func TestLoadHandsOverMediaMTX(t *testing.T) {
 		t.Errorf("Load = %+v, %v; want a rig with MediaMTX at /x/mediamtx", r, err)
 	}
 }
+
+// noKeeper is the keeper of a rig with no links.
+func noKeeper() (*link.Keeper, error) { return nil, errors.New("no links") }

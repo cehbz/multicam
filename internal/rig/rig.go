@@ -12,40 +12,53 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/cehbz/multicam/internal/blackmagic"
 	"github.com/cehbz/multicam/internal/console"
+	"github.com/cehbz/multicam/internal/link"
 	"github.com/cehbz/multicam/internal/mediamtx"
 	"github.com/cehbz/multicam/internal/sony"
 )
 
 // Rig is the cameras the server knows, in config order, each under its name
-// and ready for the console, and the MediaMTX to run beside them (nil when
-// the config names none).
+// and ready for the console, the MediaMTX to run beside them (nil when the
+// config names none) and the file that keeps the connection state.
 type Rig struct {
 	Cameras  []console.Named
 	MediaMTX *mediamtx.Server
+	State    console.StateFile
 }
 
-// Load reads the rig from the TOML config file at path.
+// stateFile is the state file's name beside the config file, where it is
+// kept unless the config names another.
+const stateFile = "connection.state"
+
+// Load reads the rig from the TOML config file at path. The links' directory
+// defaults to the config file's directory.
 func Load(path string) (*Rig, error) {
 	text, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	cameras, err := parse(string(text))
+	cfg, err := parse(string(text))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	rig := &Rig{}
-	if rig.MediaMTX, err = parseMediaMTX(string(text)); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	dir := filepath.Dir(path)
+	if cfg.state == "" {
+		cfg.state = filepath.Join(dir, stateFile)
 	}
-	for _, c := range cameras {
-		cam, err := c.Kind.open(c.Name)
+	if cfg.links.Dir == "" {
+		cfg.links.Dir = dir
+	}
+	rig := &Rig{MediaMTX: cfg.mediaMTX, State: console.StateFile(cfg.state)}
+	keeper := sync.OnceValues(func() (*link.Keeper, error) { return link.New(cfg.links) })
+	for _, c := range cfg.cameras {
+		cam, err := c.Kind.open(c.Name, keeper)
 		if err != nil {
 			return nil, fmt.Errorf("%s: camera %s: %w", path, c.Name, err)
 		}
@@ -62,30 +75,69 @@ type camera struct {
 }
 
 // kind is what a camera's table says beyond its name; open makes the camera
-// under name.
+// under name, its link, if it has one, kept by the keeper keeper returns.
 type kind interface {
-	open(name string) (console.Named, error)
+	open(name string, keeper func() (*link.Keeper, error)) (console.Named, error)
 }
 
-// sonyBody is a Sony body (kind "sony"): the network interface it is reached
-// on (empty: the system's route), its camera service endpoint
-// (sony.DefaultEndpoint when left out) and the gap a start keeps after the
-// body reports IDLE (start_gap, a duration; none when left out). The console
-// relays its liveview.
+// firstTable is the routing table of the first Sony body on an interface;
+// each next one's is one more.
+const firstTable = 2001
+
+// sonyBody is a Sony body (kind "sony"): the network interface it is joined
+// on (empty: reached over the system's route, with no link of its own), the
+// body's network name and password, which a body on an interface needs, its
+// camera service endpoint (sony.DefaultEndpoint when left out) and the gap a
+// start keeps after the body reports IDLE (start_gap, a duration; none when
+// left out). Its link's route is in Table, one per body on an interface. The
+// console relays its liveview.
 type sonyBody struct {
 	Interface string
 	Endpoint  string
 	StartGap  time.Duration
+	Network   string
+	Password  string
+	Table     int
 }
 
-func (b sonyBody) open(name string) (console.Named, error) {
+func (b sonyBody) open(name string, keeper func() (*link.Keeper, error)) (console.Named, error) {
 	cam, err := sony.NewCamera(b.Endpoint, b.Interface)
 	if err != nil {
 		return console.Named{}, err
 	}
 	cam.StartGap = b.StartGap
-	return console.Named{Name: name, Picture: console.Relay(cam), Camera: sonyCamera{cam}}, nil
+	named := console.Named{Name: name, Picture: console.Relay(cam), Camera: sonyCamera{cam}}
+	if b.Interface != "" {
+		k, err := keeper()
+		if err != nil {
+			return console.Named{}, err
+		}
+		named.Link = sonyLink{keeper: k, config: link.Config{Interface: b.Interface, Network: b.Network, Password: b.Password, Table: b.Table}}
+	}
+	return named, nil
 }
+
+// keeper joins and leaves the Sony bodies' links, as a *link.Keeper does.
+type keeper interface {
+	Join(ctx context.Context, c link.Config) (*link.Link, error)
+	Leave(ctx context.Context, iface string) error
+}
+
+// sonyLink is a Sony body's link, joined and left by its keeper.
+type sonyLink struct {
+	keeper keeper
+	config link.Config
+}
+
+func (l sonyLink) Join(ctx context.Context) (console.Joined, error) {
+	j, err := l.keeper.Join(ctx, l.config)
+	if err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+func (l sonyLink) Leave(ctx context.Context) error { return l.keeper.Leave(ctx, l.config.Interface) }
 
 // sonyCamera is a Sony body as the console watches it: recording while its
 // status is MovieRecording.
@@ -117,7 +169,7 @@ type blackmagicPhone struct {
 	Address string
 }
 
-func (p blackmagicPhone) open(name string) (console.Named, error) {
+func (p blackmagicPhone) open(name string, _ func() (*link.Keeper, error)) (console.Named, error) {
 	cam := blackmagic.NewCamera(p.Address)
 	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: cam}, nil
 }
@@ -143,26 +195,56 @@ func (s *settings) take(key string) string {
 // A camera's name is one URL path segment.
 var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
+// config is a config file's contents.
+type config struct {
+	cameras  []camera
+	mediaMTX *mediamtx.Server // nil when the file names none
+	links    link.Options     // the [link] table's
+	state    string           // the state file; empty when not named
+}
+
 // parse decodes and validates a config: at least one camera, each with a
-// unique valid name and the settings of its kind.
-func parse(text string) ([]camera, error) {
-	var config struct {
+// unique valid name and the settings of its kind, the [mediamtx] table, the
+// [link] table (supplicant, lib, dir and phy, each optional) and the state
+// file (state).
+func parse(text string) (config, error) {
+	var file struct {
+		State string `toml:"state"`
+		Link  struct {
+			Supplicant string `toml:"supplicant"`
+			Lib        string `toml:"lib"`
+			Dir        string `toml:"dir"`
+			Phy        string `toml:"phy"`
+		} `toml:"link"`
+		MediaMTX *mediaMTXTable   `toml:"mediamtx"`
 		Cameras  []map[string]any `toml:"camera"`
-		MediaMTX map[string]any   `toml:"mediamtx"` // read by parseMediaMTX
 	}
-	md, err := toml.Decode(text, &config)
+	md, err := toml.Decode(text, &file)
 	if err != nil {
-		return nil, err
+		return config{}, err
 	}
 	if unknown := md.Undecoded(); len(unknown) > 0 {
-		return nil, fmt.Errorf("unknown key %s", unknown[0])
+		return config{}, fmt.Errorf("unknown key %s", unknown[0])
 	}
-	if len(config.Cameras) == 0 {
+	cfg := config{links: link.Options(file.Link), state: file.State}
+	if cfg.mediaMTX, err = file.MediaMTX.server(); err != nil {
+		return config{}, err
+	}
+	if cfg.cameras, err = parseCameras(file.Cameras); err != nil {
+		return config{}, err
+	}
+	return cfg, nil
+}
+
+// parseCameras validates the [[camera]] tables.
+func parseCameras(tables []map[string]any) ([]camera, error) {
+	if len(tables) == 0 {
 		return nil, errors.New("no cameras")
 	}
 	var cameras []camera
 	numbers := map[string]int{}
-	for i, keys := range config.Cameras {
+	interfaces := map[string]int{} // the camera number of each body's interface
+	for i, keys := range tables {
 		s := &settings{keys: keys}
 		name := s.take("name")
 		if !validName.MatchString(name) {
@@ -177,13 +259,25 @@ func parse(text string) ([]camera, error) {
 		var kindErr error
 		switch kindName := s.take("kind"); kindName {
 		case "sony":
-			body := sonyBody{Interface: s.take("interface"), Endpoint: s.take("endpoint")}
+			body := sonyBody{Interface: s.take("interface"), Endpoint: s.take("endpoint"), Network: s.take("network"), Password: s.take("password")}
 			if body.Endpoint == "" {
 				body.Endpoint = sony.DefaultEndpoint
 			}
+			switch {
+			case body.Interface != "" && (body.Network == "" || body.Password == ""):
+				kindErr = errors.New("a body on an interface needs its network and password")
+			case body.Interface == "" && (body.Network != "" || body.Password != ""):
+				kindErr = errors.New("network and password need an interface")
+			case body.Interface != "":
+				if first, dup := interfaces[body.Interface]; dup {
+					kindErr = fmt.Errorf("interface %q is already camera %d's", body.Interface, first)
+				}
+				interfaces[body.Interface] = i + 1
+				body.Table = firstTable + len(interfaces) - 1
+			}
 			if gap := s.take("start_gap"); gap != "" {
 				d, err := time.ParseDuration(gap)
-				if err != nil {
+				if err != nil && kindErr == nil {
 					kindErr = fmt.Errorf("start_gap %q is not a duration", gap)
 				}
 				body.StartGap = d
@@ -218,38 +312,29 @@ func parse(text string) ([]camera, error) {
 // again.
 const mediaMTXRestartDelay = time.Second
 
-// parseMediaMTX reads the config's [mediamtx] table: path (the executable,
+// mediaMTXTable is the config's [mediamtx] table: path (the executable,
 // required), dir (its working directory, the executable's directory when left
-// out) and log (its output file, mediamtx.log in dir when left out). It
-// returns nil when the config has no such table.
-func parseMediaMTX(text string) (*mediamtx.Server, error) {
-	var config struct {
-		MediaMTX map[string]any `toml:"mediamtx"`
-	}
-	if _, err := toml.Decode(text, &config); err != nil {
-		return nil, err
-	}
-	if config.MediaMTX == nil {
+// out) and log (its output file, mediamtx.log in dir when left out).
+type mediaMTXTable struct {
+	Path string `toml:"path"`
+	Dir  string `toml:"dir"`
+	Log  string `toml:"log"`
+}
+
+// server is the MediaMTX t names; nil without the table.
+func (t *mediaMTXTable) server() (*mediamtx.Server, error) {
+	if t == nil {
 		return nil, nil
 	}
-	s := &settings{keys: config.MediaMTX}
-	path, dir, log := s.take("path"), s.take("dir"), s.take("log")
-	if s.err == nil {
-		if unknown := slices.Sorted(maps.Keys(s.keys)); len(unknown) > 0 {
-			s.err = fmt.Errorf("unknown key %q", unknown[0])
-		}
-	}
-	if s.err != nil {
-		return nil, fmt.Errorf("mediamtx: %w", s.err)
-	}
-	if path == "" {
+	if t.Path == "" {
 		return nil, errors.New("mediamtx: no path")
 	}
+	dir, log := t.Dir, t.Log
 	if dir == "" {
-		dir = filepath.Dir(path)
+		dir = filepath.Dir(t.Path)
 	}
 	if log == "" {
 		log = filepath.Join(dir, "mediamtx.log")
 	}
-	return &mediamtx.Server{Path: path, Dir: dir, Log: log, RestartDelay: mediaMTXRestartDelay}, nil
+	return &mediamtx.Server{Path: t.Path, Dir: dir, Log: log, RestartDelay: mediaMTXRestartDelay}, nil
 }

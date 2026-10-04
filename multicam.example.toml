@@ -1,0 +1,50 @@
+# The rig on the phone. Copy to multicam.phone.toml, which is not checked in,
+# and fill in each Sony body's network and password.
+
+# The file that keeps the connection state (the last Connect or Disconnect)
+# across restarts; connection.state beside this file when left out.
+# state = "/data/local/tmp/mc/connection.state"
+
+# The Sony bodies' links: wpa_supplicant and its libraries, the directory of
+# its control sockets and logs (this file's directory when left out) and the
+# radio. Each defaults to the phone's.
+# [link]
+# supplicant = "/data/local/tmp/wifi/bin/wpa_supplicant"
+# lib = "/data/local/tmp/wifi/lib"
+# dir = "/data/local/tmp/mc"
+# phy = "phy0"
+
+# The MediaMTX the server runs and keeps running, receiving the Pixel 9's
+# SRT livestream. dir (its working directory, where it finds mediamtx.yml)
+# defaults to the executable's directory and log to mediamtx.log in it.
+[mediamtx]
+path = "/data/local/tmp/mc/mtx/mediamtx"
+
+# Sony bodies, each joined as a Wi-Fi Direct client on its own interface to
+# its network with its password (Ctrl w/ Smartphone > Connection on the
+# body), its route in a routing table of its own. endpoint is optional and
+# defaults to the bodies' fixed camera service. start_gap is how long a start
+# waits after the body reports IDLE: the RX100M6 refuses one sooner than 3 s
+# after a stop.
+[[camera]]
+name = "rx10m4"
+kind = "sony"
+interface = "wlan1"
+network = "DIRECT-xxxx:DSC-RX10M4"
+password = "password"
+
+[[camera]]
+name = "rx100m6"
+kind = "sony"
+interface = "cam2"
+network = "DIRECT-xxxx:DSC-RX100M6"
+password = "password"
+start_gap = "3s"
+
+# The Pixel 9, driven through Blackmagic Camera's HTTP server on the home
+# LAN; its picture is the app's livestream, received by MediaMTX on this
+# phone under the camera's name.
+[[camera]]
+name = "pixel9"
+kind = "blackmagic"
+address = "192.168.1.109:4444"

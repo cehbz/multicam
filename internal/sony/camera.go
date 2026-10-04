@@ -145,10 +145,10 @@ func sleepUntil(ctx context.Context, t time.Time) error {
 }
 
 // Watch delivers the camera's status, the current one first and then each
-// change, until ctx ends and the channel closes. It holds one long poll on
-// its own connection; a poll the camera ends unchanged (Timeout) or that
-// fails is repeated, after a second on failure. One Watch per camera: the
-// camera allows one long poll at a time.
+// change, until ctx ends or a poll fails and the channel closes. It holds one
+// long poll on its own connection; a poll the camera ends unchanged (Timeout)
+// is repeated. One Watch per camera: the camera allows one long poll at a
+// time.
 func (c *Camera) Watch(ctx context.Context) (<-chan Status, error) {
 	cur, err := c.status(ctx, false)
 	if err != nil {
@@ -175,8 +175,7 @@ func (c *Camera) Watch(ctx context.Context) (<-chan Status, error) {
 			case errors.As(err, &camErr) && camErr.Code == 2:
 				continue
 			case err != nil:
-				sleepUntil(ctx, time.Now().Add(time.Second))
-				continue
+				return
 			case s == "" || s == cur:
 				continue
 			}

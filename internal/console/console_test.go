@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -26,27 +27,61 @@ import (
 )
 
 // feed is a camera whose recording state the test delivers: each Watch hands
-// out a fresh channel, sent on watched, that the test feeds and closes.
+// out a fresh channel, sent on watched, that the test feeds and closes. The
+// watch ends, as a camera's does, when its context ends.
 type feed struct {
 	watched  chan chan bool
 	watchErr atomic.Pointer[error] // Watch fails with it when set
+	watches  atomic.Int32          // Watch calls
 	startErr error
 	stopErr  error
 	starts   atomic.Int32
 	stops    atomic.Int32
+
+	mu   sync.Mutex
+	ctxs []context.Context // each successful Watch's context
 }
 
 func newFeed() *feed { return &feed{watched: make(chan chan bool, 8)} }
 
 func (f *feed) failWatch(err error) { f.watchErr.Store(&err) }
 
-func (f *feed) Watch(context.Context) (<-chan bool, error) {
+func (f *feed) Watch(ctx context.Context) (<-chan bool, error) {
+	f.watches.Add(1)
 	if err := f.watchErr.Load(); err != nil {
 		return nil, *err
 	}
-	ch := make(chan bool)
-	f.watched <- ch
-	return ch, nil
+	f.mu.Lock()
+	f.ctxs = append(f.ctxs, ctx)
+	f.mu.Unlock()
+	in, out := make(chan bool), make(chan bool)
+	f.watched <- in
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case v, ok := <-in:
+				if !ok {
+					return
+				}
+				select {
+				case out <- v:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+// watching reports whether the feed's last watch is still running.
+func (f *feed) watching() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.ctxs) > 0 && f.ctxs[len(f.ctxs)-1].Err() == nil
 }
 
 func (f *feed) StartRecording(context.Context) error {
@@ -91,6 +126,58 @@ func (f *feed) deliver(t *testing.T, ch chan bool, recording bool) {
 	}
 }
 
+// up waits for the console to watch the feed's camera and delivers its first
+// state, idle, which connects it.
+func up(t *testing.T, f *feed) chan bool {
+	t.Helper()
+	ch := f.watch(t, time.Second)
+	f.deliver(t, ch, false)
+	return ch
+}
+
+// awaitUp waits for the console to show each camera named connected.
+func awaitUp(t *testing.T, console http.Handler, names ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	pr, pw := io.Pipe()
+	go func() {
+		console.ServeHTTP(&pipeWriter{header: http.Header{}, body: pw}, httptest.NewRequestWithContext(ctx, http.MethodGet, "/events", nil))
+		pw.Close()
+	}()
+	defer pr.Close()
+	events := make(chan string, 64)
+	go func() {
+		defer close(events)
+		readEvents(bufio.NewScanner(pr), events)
+	}()
+	waiting := map[string]bool{}
+	for _, name := range names {
+		waiting[name] = true
+	}
+	for e := range events {
+		var s state
+		if json.Unmarshal([]byte(e), &s) == nil && s.Connection == connected {
+			delete(waiting, s.Name)
+		}
+		if len(waiting) == 0 {
+			return
+		}
+	}
+	t.Fatalf("cameras %v not connected within 5 s", waiting)
+}
+
+// saved returns a state file holding the connection state, Connected or
+// Disconnected.
+func saved(t *testing.T, connected bool) StateFile {
+	t.Helper()
+	f := StateFile(filepath.Join(t.TempDir(), "connection.state"))
+	if err := f.Save(connected); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
 // relayed returns the Sony body at endpoint under name, its state fed by the
 // returned feed.
 func relayed(t *testing.T, name, endpoint string) (Named, *feed) {
@@ -110,21 +197,29 @@ func fed(name string) (Named, *feed) {
 	return Named{Name: name, Picture: Streamed{Path: name}, Camera: f}, f
 }
 
-// oneBody returns a fake Sony body, its feed and the console for it alone.
+// oneBody returns a fake Sony body, its feed and the connected console for
+// it alone.
 func oneBody(t *testing.T) (*sonytest.Camera, *feed, http.Handler) {
 	fake := sonytest.NewCamera(t)
 	cam, f := relayed(t, "cam", fake.Endpoint())
-	return fake, f, New(t.Context(), []Named{cam})
+	console := New(t.Context(), []Named{cam}, saved(t, true))
+	up(t, f)
+	awaitUp(t, console, "cam")
+	return fake, f, console
 }
 
-// twoCameras returns two fake Sony bodies and the console for them as "front"
-// and "side", in that order. The side camera's frames are its own.
+// twoCameras returns two fake Sony bodies and the connected console for them
+// as "front" and "side", in that order. The side camera's frames are its own.
 func twoCameras(t *testing.T) (front, side *sonytest.Camera, console http.Handler) {
 	front, side = sonytest.NewCamera(t), sonytest.NewCamera(t)
 	side.Frames = [][]byte{[]byte("side frame 1"), []byte("side frame 2")}
-	f, _ := relayed(t, "front", front.Endpoint())
-	s, _ := relayed(t, "side", side.Endpoint())
-	return front, side, New(t.Context(), []Named{f, s})
+	f, ff := relayed(t, "front", front.Endpoint())
+	s, sf := relayed(t, "side", side.Endpoint())
+	console = New(t.Context(), []Named{f, s}, saved(t, true))
+	up(t, ff)
+	up(t, sf)
+	awaitUp(t, console, "front", "side")
+	return front, side, console
 }
 
 // get answers a GET of target from the console.
@@ -300,7 +395,6 @@ func TestStartErrorAnswersWithErrorStatus(t *testing.T) {
 
 func TestCommandLeavesTheViewersLiveviewRunning(t *testing.T) {
 	fake, f, console := oneBody(t)
-	f.deliver(t, f.watch(t, time.Second), false)
 	srv := httptest.NewServer(console)
 	defer srv.Close()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -438,7 +532,7 @@ var videoTag = regexp.MustCompile(`<video [^>]*>`)
 func TestStreamedTileIsVideoFedByWHEP(t *testing.T) {
 	phone, _ := fed("pixel9")
 	body, _ := relayed(t, "body", sonytest.NewCamera(t).Endpoint())
-	console := New(t.Context(), []Named{phone, body})
+	console := New(t.Context(), []Named{phone, body}, saved(t, false))
 	page := get(console, "/").Body.String()
 	if got, want := srcs(tileCamera, page), []string{"pixel9", "body"}; !slices.Equal(got, want) {
 		t.Fatalf("tiles %v, want %v", got, want)
@@ -554,7 +648,10 @@ func (s *stillsSession) Close() error {
 
 func TestRelaysAnyCamerasLiveview(t *testing.T) {
 	cam := &stills{frames: [][]byte{[]byte("screen 1"), []byte("screen 2"), []byte("screen 3")}}
-	console := New(t.Context(), []Named{{Name: "phone", Picture: Relay(cam), Camera: newFeed()}})
+	f := newFeed()
+	console := New(t.Context(), []Named{{Name: "phone", Picture: Relay(cam), Camera: f}}, saved(t, true))
+	up(t, f)
+	awaitUp(t, console, "phone")
 
 	rec := get(console, "/phone/liveview")
 	mediaType, params, err := mime.ParseMediaType(rec.Header().Get("Content-Type"))
@@ -582,7 +679,10 @@ func TestRelayedFailedStartHasNoSession(t *testing.T) {
 	if err == nil || lv != nil {
 		t.Errorf("Liveview = %#v, %v; want no session and the error", lv, err)
 	}
-	console := New(t.Context(), []Named{{Name: "phone", Picture: Relay(cam), Camera: newFeed()}})
+	f := newFeed()
+	console := New(t.Context(), []Named{{Name: "phone", Picture: Relay(cam), Camera: f}}, saved(t, true))
+	up(t, f)
+	awaitUp(t, console, "phone")
 	if rec := get(console, "/phone/liveview"); rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "screen off") {
 		t.Errorf("picture: status %d %q, want %d with the error", rec.Code, rec.Body, http.StatusBadGateway)
 	}
@@ -604,13 +704,15 @@ func ask(t *testing.T, console http.Handler, method, target string) []state {
 	return r.Cameras
 }
 
-// summary renders states one camera per word: its name, then "=recording",
-// "=idle" or "=?", then "!" when it carries an error.
+// summary renders states one camera per word: its name, then "=recording"
+// or "=idle" when connected (or "=?" when its state is unread),
+// "=connecting", or "=off" when disconnected, then "!" when it carries an
+// error.
 func summary(states []state) string {
 	var words []string
 	for _, s := range states {
-		word := s.Name + "=?"
-		if s.Recording != nil {
+		word := s.Name + "=" + map[connState]string{connected: "?", connecting: "connecting", disconnected: "off"}[s.Connection]
+		if s.Connection == connected && s.Recording != nil {
 			word = s.Name + map[bool]string{true: "=recording", false: "=idle"}[*s.Recording]
 		}
 		if s.Error != "" {
@@ -631,70 +733,9 @@ func states(c *console) []state {
 	return states
 }
 
-func TestWatcherKeepsTheLastStateAndWatchesAgainAfterTheSourceEnds(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		cam, f := fed("cam")
-		c := newConsole(t.Context(), []Named{cam})
-		synctest.Wait()
-		if got, want := summary(states(c)), "cam=?!"; got != want {
-			t.Fatalf("state before the camera answered %q, want %q", got, want)
-		}
-		ch := f.watch(t, time.Second)
-		ch <- true
-		synctest.Wait()
-		if got, want := summary(states(c)), "cam=recording"; got != want {
-			t.Fatalf("state %q, want %q", got, want)
-		}
-		ch <- false
-		synctest.Wait()
-		if got, want := summary(states(c)), "cam=idle"; got != want {
-			t.Fatalf("state %q, want %q", got, want)
-		}
-
-		close(ch)
-		synctest.Wait()
-		if got, want := summary(states(c)), "cam=idle"; got != want {
-			t.Errorf("state after the source ended %q, want the last one, %q", got, want)
-		}
-		if len(f.watched) != 0 {
-			t.Fatal("the camera was watched again at once, want after a second")
-		}
-		time.Sleep(time.Second)
-		synctest.Wait()
-		ch = f.watch(t, 0)
-		ch <- true
-		synctest.Wait()
-		if got, want := summary(states(c)), "cam=recording"; got != want {
-			t.Errorf("state from the second watch %q, want %q", got, want)
-		}
-	})
-}
-
-func TestWatchFailureIsTheCamerasErrorUntilItWorks(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		cam, f := fed("cam")
-		f.failWatch(errors.New("getEvent: connection refused"))
-		c := newConsole(t.Context(), []Named{cam})
-		synctest.Wait()
-		s := states(c)
-		if got, want := summary(s), "cam=?!"; got != want || s[0].Error != "getEvent: connection refused" {
-			t.Fatalf("state %q with error %q, want %q with the watch error", got, s[0].Error, want)
-		}
-
-		f.watchErr.Store(nil)
-		time.Sleep(time.Second)
-		synctest.Wait()
-		ch := f.watch(t, 0)
-		ch <- false
-		synctest.Wait()
-		if got, want := summary(states(c)), "cam=idle"; got != want {
-			t.Errorf("state once the watch works %q, want %q", got, want)
-		}
-	})
-}
-
-// events opens the console's event stream at base and returns its events'
-// data lines as they arrive. The stream ends with the test.
+// events opens the console's event stream at base and returns its events as
+// they arrive: an unnamed event's data, or a named one's name, a space and
+// its data. The stream ends with the test.
 func events(t *testing.T, base string) <-chan string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -711,14 +752,25 @@ func events(t *testing.T, base string) <-chan string {
 	lines := make(chan string, 16)
 	go func() {
 		defer close(lines)
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			if data, ok := strings.CutPrefix(scanner.Text(), "data: "); ok {
-				lines <- data
-			}
-		}
+		readEvents(bufio.NewScanner(resp.Body), lines)
 	}()
 	return lines
+}
+
+// readEvents sends each event scanner reads to events: an unnamed event's
+// data, or a named one's name, a space and its data.
+func readEvents(scanner *bufio.Scanner, events chan<- string) {
+	name := ""
+	for scanner.Scan() {
+		line := scanner.Text()
+		if n, ok := strings.CutPrefix(line, "event: "); ok {
+			name = n + " "
+		}
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			events <- name + data
+			name = ""
+		}
+	}
 }
 
 // next is the next event's data, failing when none arrives in time.
@@ -736,45 +788,86 @@ func next(t *testing.T, lines <-chan string) string {
 	}
 }
 
-func TestEventsSendEveryCamerasStateThenEachChange(t *testing.T) {
-	front, f := fed("front")
-	side, s := fed("side")
-	srv := httptest.NewServer(New(t.Context(), []Named{front, side}))
-	t.Cleanup(srv.Close) // after the event streams, opened later, are closed
-	fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
+func TestEventsSendTheConnectionAndEveryCamerasStateThenEachChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		front, f := fed("front")
+		side, s := fed("side")
+		console := New(t.Context(), []Named{front, side}, saved(t, false))
+		synctest.Wait()
 
-	lines := events(t, srv.URL)
-	if got, want := next(t, lines), `{"name":"front","error":"status unread"}`; got != want {
-		t.Errorf("first event %s, want %s", got, want)
-	}
-	if got, want := next(t, lines), `{"name":"side","error":"status unread"}`; got != want {
-		t.Errorf("second event %s, want %s", got, want)
-	}
-	f.deliver(t, fch, true)
-	if got, want := next(t, lines), `{"name":"front","recording":true}`; got != want {
-		t.Errorf("event %s, want %s", got, want)
-	}
-	s.deliver(t, sch, false)
-	if got, want := next(t, lines), `{"name":"side","recording":false}`; got != want {
-		t.Errorf("event %s, want %s", got, want)
-	}
-	s.deliver(t, sch, true)
-	if got, want := next(t, lines), `{"name":"side","recording":true}`; got != want {
-		t.Errorf("event %s, want %s", got, want)
-	}
-
-	// A second viewer gets the states as they are now.
-	later := events(t, srv.URL)
-	for _, want := range []string{`{"name":"front","recording":true}`, `{"name":"side","recording":true}`} {
-		if got := next(t, later); got != want {
-			t.Errorf("later viewer's event %s, want %s", got, want)
+		events := stream(t, console)
+		synctest.Wait()
+		for _, want := range []string{
+			`connection {"connection":"disconnected","connecting":false}`,
+			`{"name":"front","connection":"disconnected"}`,
+			`{"name":"side","connection":"disconnected"}`,
+		} {
+			if got := waiting(t, events); got != want {
+				t.Errorf("event %s, want %s", got, want)
+			}
 		}
+		post(console, "/connect")
+		synctest.Wait()
+		assertLatest(t, events,
+			`connection {"connection":"connected","connecting":true}`,
+			`{"name":"front","connection":"connecting"}`,
+			`{"name":"side","connection":"connecting"}`)
+		fch, sch := f.watch(t, 0), s.watch(t, 0)
+		fch <- true
+		synctest.Wait()
+		assertLatest(t, events, `{"name":"front","connection":"connected","recording":true}`)
+		sch <- false
+		synctest.Wait()
+		assertLatest(t, events,
+			`connection {"connection":"connected","connecting":false}`,
+			`{"name":"side","connection":"connected","recording":false}`)
+
+		// A second viewer gets the states as they are now.
+		later := stream(t, console)
+		synctest.Wait()
+		for _, want := range []string{
+			`connection {"connection":"connected","connecting":false}`,
+			`{"name":"front","connection":"connected","recording":true}`,
+			`{"name":"side","connection":"connected","recording":false}`,
+		} {
+			if got := waiting(t, later); got != want {
+				t.Errorf("later viewer's event %s, want %s", got, want)
+			}
+		}
+		// A repeat of the current state is not a change.
+		sch <- false
+		fch <- false
+		synctest.Wait()
+		assertLatest(t, events, `{"name":"front","connection":"connected","recording":false}`)
+	})
+}
+
+// assertLatest drains the events waiting and checks that they end with each
+// event of want for its subject (the connection or a camera), and carry no
+// other subject's.
+func assertLatest(t *testing.T, events <-chan string, want ...string) {
+	t.Helper()
+	subject := func(e string) string {
+		if strings.HasPrefix(e, "connection ") {
+			return "connection"
+		}
+		var s state
+		json.Unmarshal([]byte(e), &s)
+		return s.Name
 	}
-	// A repeat of the current state is not a change.
-	s.deliver(t, sch, true)
-	f.deliver(t, fch, false)
-	if got, want := next(t, lines), `{"name":"front","recording":false}`; got != want {
-		t.Errorf("event %s, want %s", got, want)
+	latest := map[string]string{}
+	for len(events) > 0 {
+		e := <-events
+		latest[subject(e)] = e
+	}
+	for _, w := range want {
+		if got := latest[subject(w)]; got != w {
+			t.Errorf("latest %s event %s, want %s", subject(w), got, w)
+		}
+		delete(latest, subject(w))
+	}
+	for _, e := range latest {
+		t.Errorf("event %s, want none for its subject", e)
 	}
 }
 
@@ -792,7 +885,7 @@ func (p *pipeWriter) Flush()                      {}
 func TestEventsKeepTheStreamAliveEvery15s(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cam, f := fed("cam")
-		console := New(t.Context(), []Named{cam})
+		console := New(t.Context(), []Named{cam}, saved(t, true))
 		ch := f.watch(t, time.Second)
 		ch <- false
 		synctest.Wait()
@@ -813,8 +906,13 @@ func TestEventsKeepTheStreamAliveEvery15s(t *testing.T) {
 			}
 			return lines.Text()
 		}
-		if got, want := line(), `data: {"name":"cam","recording":false}`; got != want {
-			t.Fatalf("first line %q, want %q", got, want)
+		for _, want := range []string{"event: connection", `data: {"connection":"connected","connecting":false}`, ""} {
+			if got := line(); got != want {
+				t.Fatalf("line %q, want %q", got, want)
+			}
+		}
+		if got, want := line(), `data: {"name":"cam","connection":"connected","recording":false}`; got != want {
+			t.Fatalf("camera's line %q, want %q", got, want)
 		}
 		if got := line(); got != "" {
 			t.Fatalf("line after the event %q, want the empty line ending it", got)
@@ -834,27 +932,27 @@ func TestStartAllStartsTheCamerasNotRecording(t *testing.T) {
 		side, s := fed("side")
 		gone, g := fed("gone")
 		g.failWatch(errors.New("getEvent: connection refused"))
-		console := New(t.Context(), []Named{front, side, gone})
+		console := New(t.Context(), []Named{front, side, gone}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
 		fch <- true
 		sch <- false
 		synctest.Wait()
 
 		states := ask(t, console, http.MethodPost, "/start")
-		if got, want := summary(states), "front=recording side=idle gone=?!"; got != want {
+		if got, want := summary(states), "front=recording side=idle gone=off!"; got != want {
 			t.Errorf("report %q, want %q", got, want)
 		}
-		if states[2].Error != "getEvent: connection refused" {
-			t.Errorf("unknown camera's error %q, want its watch error", states[2].Error)
+		if states[2].Error != "not connected" {
+			t.Errorf("camera not connected: error %q, want not connected", states[2].Error)
 		}
-		if f.starts.Load() != 0 || s.starts.Load() != 1 || g.starts.Load() != 1 {
-			t.Errorf("starts: front %d, side %d, gone %d; want only the cameras not known to be recording started",
+		if f.starts.Load() != 0 || s.starts.Load() != 1 || g.starts.Load() != 0 {
+			t.Errorf("starts: front %d, side %d, gone %d; want only the connected camera not recording started",
 				f.starts.Load(), s.starts.Load(), g.starts.Load())
 		}
 		// The side camera's change is reported once it arrives.
 		sch <- true
 		synctest.Wait()
-		if got, want := summary(ask(t, console, http.MethodPost, "/start")), "front=recording side=recording gone=?!"; got != want {
+		if got, want := summary(ask(t, console, http.MethodPost, "/start")), "front=recording side=recording gone=off!"; got != want {
 			t.Errorf("report %q, want %q", got, want)
 		}
 		if s.starts.Load() != 1 {
@@ -867,7 +965,7 @@ func TestStopAllStopsTheCamerasNotIdle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		front, f := fed("front")
 		side, s := fed("side")
-		console := New(t.Context(), []Named{front, side})
+		console := New(t.Context(), []Named{front, side}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
 		fch <- true
 		sch <- false
@@ -887,7 +985,7 @@ func TestOneCamerasRefusalIsItsOwnError(t *testing.T) {
 		front, f := fed("front")
 		side, s := fed("side")
 		s.startErr = errors.New("startMovieRec: camera error 40401 (Camera Not Ready)")
-		console := New(t.Context(), []Named{front, side})
+		console := New(t.Context(), []Named{front, side}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
 		fch <- false
 		sch <- false
@@ -916,7 +1014,7 @@ func TestOneCamerasCommand(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		front, f := fed("front")
 		side, s := fed("side")
-		console := New(t.Context(), []Named{front, side})
+		console := New(t.Context(), []Named{front, side}, saved(t, true))
 		fch, sch := f.watch(t, time.Second), s.watch(t, time.Second)
 		fch <- false
 		sch <- false
@@ -953,7 +1051,7 @@ func TestRefusedStopKeepsTheCamerasState(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cam, f := fed("cam")
 		f.stopErr = errors.New("stopMovieRec: camera error 40401 (Camera Not Ready): Not <b>Ready</b>")
-		console := New(t.Context(), []Named{cam})
+		console := New(t.Context(), []Named{cam}, saved(t, true))
 		ch := f.watch(t, time.Second)
 		ch <- true
 		synctest.Wait()
@@ -982,9 +1080,10 @@ func (c *timed) wait() error {
 	return c.err
 }
 
-func (c *timed) Watch(context.Context) (<-chan bool, error) {
+func (c *timed) Watch(ctx context.Context) (<-chan bool, error) {
 	ch := make(chan bool, 1)
 	ch <- false
+	context.AfterFunc(ctx, func() { close(ch) })
 	return ch, nil
 }
 
@@ -1006,7 +1105,7 @@ func TestCamerasAreCommandedTogether(t *testing.T) {
 			{Name: "asleep", Picture: Streamed{Path: "asleep"}, Camera: asleep},
 			{Name: "slow", Picture: Streamed{Path: "slow"}, Camera: slow},
 			{Name: "quick", Picture: Streamed{Path: "quick"}, Camera: quick},
-		})
+		}, saved(t, true))
 		synctest.Wait()
 
 		began := time.Now()

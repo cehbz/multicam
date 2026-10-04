@@ -60,8 +60,9 @@ func configPath(args []string) (string, error) {
 }
 
 // run serves the console for the rig's cameras on ln until ctx is done. The
-// console watches the cameras and requests end with ctx, and run returns
-// once their liveview sessions have closed. The rig's MediaMTX, if any, runs
+// console's connection to the cameras starts as the rig's state file says,
+// and it and requests end with ctx; run returns once their liveview sessions
+// have closed. The camera links stay as they are. The rig's MediaMTX, if any, runs
 // until ctx is done and is ended before run returns.
 func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
 	var names []string
@@ -69,7 +70,7 @@ func run(ctx context.Context, ln net.Listener, r *rig.Rig) error {
 		names = append(names, c.Name)
 	}
 	srv := &http.Server{
-		Handler:     console.New(ctx, r.Cameras),
+		Handler:     console.New(ctx, r.Cameras, r.State),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	var media sync.WaitGroup

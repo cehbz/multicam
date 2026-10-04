@@ -407,6 +407,27 @@ func TestWatchPollsAgainAfterTheCameraTimesOutAPoll(t *testing.T) {
 	}
 }
 
+func TestWatchEndsWhenAPollFails(t *testing.T) {
+	fake := sonytest.NewCamera(t)
+	ch, err := newCamera(t, fake).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive(t, ch)
+	fake.PushError(40401, "Camera Not Ready")
+	select {
+	case s, ok := <-ch:
+		if ok {
+			t.Fatalf("got %q after a failed poll, want the channel closed", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("channel not closed within 2 s of a failed poll")
+	}
+	if got, want := fake.Calls(), []string{"getEvent@1.3", "getEvent@1.3+"}; !slices.Equal(got, want) {
+		t.Errorf("camera calls %v, want no poll after the failed one, %v", got, want)
+	}
+}
+
 func TestWatchClosesWhenTheContextEnds(t *testing.T) {
 	fake := sonytest.NewCamera(t)
 	ctx, cancel := context.WithCancel(t.Context())

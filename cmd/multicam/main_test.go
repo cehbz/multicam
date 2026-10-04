@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cehbz/multicam/internal/console"
 	"github.com/cehbz/multicam/internal/mediamtx"
 	"github.com/cehbz/multicam/internal/rig"
 	"github.com/cehbz/multicam/internal/sony/sonytest"
@@ -110,29 +111,27 @@ func TestRunServesSonyCamerasUntilStopped(t *testing.T) {
 		}
 		last = max(last, i)
 	}
-	// The console's events carry each camera's state, which it watches on
-	// the body's long poll, and then each change. A camera's state is unread
-	// until its first poll answers; the bodies answer in their own order.
+	// With nothing saved the server starts Disconnected. Connect watches
+	// each body on its long poll, and the console's events carry each
+	// camera's state and then each change.
 	events := events(t, base)
-	awaited := map[string]bool{`{"name":"one","recording":false}`: true, `{"name":"two","recording":false}`: true}
-	for len(awaited) > 0 {
-		got := nextEvent(t, events)
-		if awaited[got] {
-			delete(awaited, got)
-		} else if !strings.Contains(got, `"status unread"`) {
-			t.Fatalf("event %q, want a camera's unread or idle state", got)
-		}
+	awaitEvent(t, events, `{"connection":"disconnected","connecting":false}`)
+	want := `{"connection":"connected","cameras":[{"name":"one","connection":"connected","recording":false},{"name":"two","connection":"connected","recording":false}]}` + "\n"
+	if got := body(http.Post(base+"/connect", "", nil)); got != want {
+		t.Errorf("Connect's answer %q, want %q", got, want)
+	}
+	awaitEvent(t, events, `{"name":"one","connection":"connected","recording":false}`, `{"name":"two","connection":"connected","recording":false}`)
+	if connected, err := r.State.Connected(); !connected || err != nil {
+		t.Errorf("saved state %v, %v; want Connected", connected, err)
 	}
 
 	// Start on the second camera alone: the report carries the state the
 	// console knew; the change arrives as an event once the body reports it.
-	if got, want := body(http.Post(base+"/two/start", "", nil)), `{"cameras":[{"name":"two","recording":false}]}`+"\n"; got != want {
+	if got, want := body(http.Post(base+"/two/start", "", nil)), `{"cameras":[{"name":"two","connection":"connected","recording":false}]}`+"\n"; got != want {
 		t.Errorf("report of the second camera's start %q, want %q", got, want)
 	}
 	second.Push("MovieRecording")
-	if got, want := nextEvent(t, events), `{"name":"two","recording":true}`; got != want {
-		t.Errorf("event %q, want %q", got, want)
-	}
+	awaitEvent(t, events, `{"name":"two","connection":"connected","recording":true}`)
 	if got, want := sonyFake.Calls(), []string{"getEvent@1.3", "getEvent@1.3+"}; !slices.Equal(got, want) {
 		t.Errorf("first camera's calls after the second's Start %v, want its watch alone, %v", got, want)
 	}
@@ -202,18 +201,25 @@ func events(t *testing.T, base string) <-chan string {
 	return lines
 }
 
-// nextEvent is the next event's data, failing when none arrives in time.
-func nextEvent(t *testing.T, lines <-chan string) string {
+// awaitEvent waits for an event with each data of want, in any order,
+// skipping the others, failing when they don't arrive in time.
+func awaitEvent(t *testing.T, lines <-chan string, want ...string) {
 	t.Helper()
-	select {
-	case data, ok := <-lines:
-		if !ok {
-			t.Fatal("the event stream ended")
+	awaited := map[string]bool{}
+	for _, w := range want {
+		awaited[w] = true
+	}
+	timeout := time.After(5 * time.Second)
+	for len(awaited) > 0 {
+		select {
+		case data, ok := <-lines:
+			if !ok {
+				t.Fatal("the event stream ended")
+			}
+			delete(awaited, data)
+		case <-timeout:
+			t.Fatalf("events %v did not arrive", awaited)
 		}
-		return data
-	case <-time.After(5 * time.Second):
-		t.Fatal("no event arrived")
-		return ""
 	}
 }
 
@@ -228,7 +234,10 @@ func TestRunKeepsMediaMTXRunningAndEndsItWithTheServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &rig.Rig{MediaMTX: &mediamtx.Server{Path: exe, Dir: dir, Log: filepath.Join(dir, "log"), RestartDelay: time.Second}}
+	r := &rig.Rig{
+		MediaMTX: &mediamtx.Server{Path: exe, Dir: dir, Log: filepath.Join(dir, "log"), RestartDelay: time.Second},
+		State:    console.StateFile(filepath.Join(dir, "connection.state")),
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- run(ctx, ln, r) }()
