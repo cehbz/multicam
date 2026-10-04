@@ -3,17 +3,13 @@
 Design and findings: KB node `projects/multicam.md`.
 
 ## Stories, in order
-0. Cold-start run of the rig: the Pixel 3 XL rebooted and unlocked once, the
-   Sony bodies off, the Pixel 9 locked with Blackmagic Camera closed. Not yet
-   seen on the phone: a result popping up as a banner, and Start rig reusing
-   the console's tab.
-1. Keep the Pixel 3 XL awake while it is on power and the console page is
-   being viewed: when its screen sleeps, the page's pictures freeze until it
-   is reloaded.
-2. Clip-end restart: a Sony body whose status goes from `MovieRecording`
+0. Cold-start run of the rig: the Pixel 3 XL rebooted and unlocked once,
+   the Sony bodies off, the Pixel 9 locked with Blackmagic Camera closed;
+   then open the app and Connect.
+1. Clip-end restart: a Sony body whose status goes from `MovieRecording`
    to `IDLE` without a stop from the console is started again, after its
    gap. Sony stops a clip at about 29 minutes.
-3. The camera's overheating flag on its tile: `continuousError` carrying
+2. The camera's overheating flag on its tile: `continuousError` carrying
    `Overheating Warning` with `isContinued: true` in the Sony event
    stream; Blackmagic's equivalent unknown.
 
