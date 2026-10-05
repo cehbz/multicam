@@ -196,13 +196,24 @@ function say(text) {
 // The console pushes the server's connection and every camera's state on
 // connection, and then each change, always the newest. A state that matches
 // an intent is the server or camera agreeing. The browser reconnects a
-// dropped stream by itself and the states arrive again.
+// dropped stream by itself and the states arrive again; a picture running
+// across the drop is ended and requested afresh, as its stream may have ended
+// without an event.
 const events = new EventSource('/events');
+let dropped = false;
 events.onopen = () => {
 	fault.textContent = '';
+	if (dropped) {
+		for (const t of all) {
+			if (t.run) t.picture.stop();
+			t.run = null;
+		}
+		dropped = false;
+	}
 	draw();
 };
 events.onerror = () => {
+	dropped = true;
 	fault.textContent = 'console: events disconnected';
 	draw();
 };

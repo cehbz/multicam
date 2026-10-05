@@ -668,6 +668,28 @@ func TestScriptRunsAPictureOnlyWhileItCanBePlayed(t *testing.T) {
 	}
 }
 
+// A reconnect after an error ends every running picture, since the browser
+// reports nothing when a restarted server ends a picture's stream; draw then
+// requests each again.
+var (
+	dropMarked   = regexp.MustCompile(`events\.onerror = \(\) => \{[^}]*dropped = true;`)
+	dropRestarts = regexp.MustCompile(`events\.onopen = \(\) => \{[^}]*if \(dropped\) \{[^}]*t\.picture\.stop\(\);[^}]*t\.run = null;\s*\}\s*dropped = false;\s*\}\s*draw\(\);`)
+)
+
+func TestScriptRequestsEveryPictureAgainWhenTheEventsReconnectAfterAnError(t *testing.T) {
+	_, _, console := twoCameras(t)
+	m := script.FindStringSubmatch(get(console, "/").Body.String())
+	if m == nil {
+		t.Fatal("page has no script")
+	}
+	if !dropMarked.MatchString(m[1]) {
+		t.Errorf("script does not note an events error: %q", m[1])
+	}
+	if !dropRestarts.MatchString(m[1]) {
+		t.Errorf("script does not end every picture when the events reconnect after an error: %q", m[1])
+	}
+}
+
 var videoTag = regexp.MustCompile(`<video [^>]*>`)
 
 func TestStreamedTileIsVideoFedByWHEP(t *testing.T) {
