@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -685,5 +686,174 @@ func waiting(t *testing.T, events <-chan string) string {
 	default:
 		t.Fatal("no event waiting")
 		return ""
+	}
+}
+
+// awaited is a camera's precondition, which holds once the test closes
+// holds; waits counts its Waits.
+type awaited struct {
+	name  string
+	holds chan struct{}
+	waits atomic.Int32
+}
+
+func newAwaited(name string) *awaited { return &awaited{name: name, holds: make(chan struct{})} }
+
+func (p *awaited) Wait(ctx context.Context) error {
+	p.waits.Add(1)
+	select {
+	case <-p.holds:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *awaited) String() string { return p.name }
+
+func TestATryWaitsForItsCamerasPrecondition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		body, bf, bl := linked("body")
+		wifi := newAwaited("body wifi")
+		body.Precondition = wifi
+		phone, pf := fed("phone")
+		network := newAwaited("network")
+		phone.Precondition = network
+		state := saved(t, true)
+		console := New(t.Context(), []Named{body, phone}, state)
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if joins, _ := bl.counts(); joins != 0 || bf.watches.Load()+pf.watches.Load() != 0 {
+			t.Errorf("an hour without the preconditions: %d joins, %d watches; want no try", joins, bf.watches.Load()+pf.watches.Load())
+		}
+		if connected, _ := state.Connected(); !connected {
+			t.Error("saved state Disconnected while the cameras wait, want Connected")
+		}
+		if server, cams := look(t, console); server.Connection != connected || cams != "body=connecting phone=connecting" {
+			t.Errorf("server %+v, cameras %q; want Connected with both cameras waiting", server, cams)
+		}
+
+		close(wifi.holds)
+		synctest.Wait()
+		if joins, _ := bl.counts(); joins != 1 {
+			t.Errorf("%d joins once the body's precondition holds, want its try", joins)
+		}
+		bf.watch(t, 0) <- Status{}
+		synctest.Wait()
+		if pf.watches.Load() != 0 {
+			t.Error("phone tried before its precondition holds")
+		}
+		close(network.holds)
+		synctest.Wait()
+		pf.watch(t, 0) <- Status{Recording: true}
+		synctest.Wait()
+		if server, cams := look(t, console); server != isConnected || cams != "body=idle phone=recording" {
+			t.Errorf("server %+v, cameras %q; want Connected with both cameras up", server, cams)
+		}
+		if connected, _ := state.Connected(); !connected {
+			t.Error("saved state Disconnected, want Connected")
+		}
+	})
+}
+
+func TestDisconnectDuringAWaitMakesNoTry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		body, bf, bl := linked("body")
+		wifi := newAwaited("body wifi")
+		body.Precondition = wifi
+		console := New(t.Context(), []Named{body}, saved(t, false))
+		synctest.Wait()
+
+		answer := post(console, "/connect")
+		synctest.Wait()
+		if wifi.waits.Load() != 1 {
+			t.Fatalf("%d waits for the precondition, want the try waiting", wifi.waits.Load())
+		}
+		disconnect(t, console)
+		if rep := connectAnswer(t, answer); rep.Connection != disconnected || rep.Error != "ended by Disconnect" {
+			t.Errorf("Connect's answer %+v, want Disconnected, ended by the Disconnect", rep)
+		}
+		close(wifi.holds)
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if joins, _ := bl.counts(); joins != 0 || bf.watches.Load() != 0 {
+			t.Errorf("%d joins, %d watches; want no try", joins, bf.watches.Load())
+		}
+		if server, cams := look(t, console); server != isDisconnected || cams != "body=off" {
+			t.Errorf("server %+v, cameras %q; want Disconnected with the body off and no error", server, cams)
+		}
+	})
+}
+
+func TestACameraWaitingHoldsBackNoOther(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, af, al := linked("a")
+		a.Precondition = newAwaited("a wifi") // never holds
+		b, bf, bl := linked("b")
+		phone, pf := fed("phone")
+		console := New(t.Context(), []Named{a, b, phone}, saved(t, true))
+		synctest.Wait()
+		bf.watch(t, 0) <- Status{}
+		pf.watch(t, 0) <- Status{Recording: true}
+		synctest.Wait()
+		if server, cams := look(t, console); server.Connection != connected || cams != "a=connecting b=idle phone=recording" {
+			t.Errorf("server %+v, cameras %q; want Connected with b and phone up while a waits", server, cams)
+		}
+		aj, _ := al.counts()
+		bj, _ := bl.counts()
+		if aj != 0 || bj != 1 || af.watches.Load() != 0 {
+			t.Errorf("joins: a %d, b %d; a watched %d times; want only b joined", aj, bj, af.watches.Load())
+		}
+	})
+}
+
+func TestAWaitingCameraShowsWhatItWaitsFor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		body, _, _ := linked("rx10m4")
+		wifi := newAwaited("rx10m4 wifi")
+		body.Precondition = wifi
+		phone, _ := fed("pixel9")
+		phone.Precondition = newAwaited("network")
+		console := New(t.Context(), []Named{body, phone}, saved(t, true))
+		synctest.Wait()
+		events := stream(t, console)
+		synctest.Wait()
+		waiting(t, events) // the server's connection
+		for _, want := range []state{
+			{Name: "rx10m4", Connection: connecting, Waiting: "rx10m4 wifi"},
+			{Name: "pixel9", Connection: connecting, Waiting: "network"},
+		} {
+			var s state
+			if err := json.Unmarshal([]byte(waiting(t, events)), &s); err != nil {
+				t.Fatal(err)
+			}
+			if !s.same(want) {
+				t.Errorf("state %+v, want %+v", s, want)
+			}
+		}
+
+		close(wifi.holds)
+		synctest.Wait()
+		var s state
+		if err := json.Unmarshal([]byte(waiting(t, events)), &s); err != nil {
+			t.Fatal(err)
+		}
+		if want := (state{Name: "rx10m4", Connection: connecting}); !s.same(want) {
+			t.Errorf("once its precondition holds: %+v, want %+v", s, want)
+		}
+	})
+}
+
+// The page shows a camera waiting as what it waits for.
+var waitingText = regexp.MustCompile(`s\.waiting \? 'waiting for ' \+ s\.waiting :`)
+
+func TestScriptShowsWhatATileWaitsFor(t *testing.T) {
+	cam, _ := fed("pixel9")
+	m := script.FindStringSubmatch(get(New(t.Context(), []Named{cam}, saved(t, false)), "/").Body.String())
+	if m == nil {
+		t.Fatal("page has no script")
+	}
+	if !waitingText.MatchString(m[1]) {
+		t.Errorf("script does not show what a tile waits for: %q", m[1])
 	}
 }

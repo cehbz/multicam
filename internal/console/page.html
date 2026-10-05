@@ -95,12 +95,12 @@ const server = {connected: false, intent: null, asked: 0};
 // or answers, else the server's connection.
 function connected() { return server.intent ?? server.connected; }
 
-// A tile's state: its camera's connection, and as its error the try's error
-// or the connection when not connected; the camera's last known recording
-// status; what the last tap asked for while the camera has yet to agree (null
-// otherwise); the refusal of its last command; and its picture: whether the
-// camera's state says it can be played, the running request (null when
-// none) and whether it failed.
+// A tile's state: its camera's connection, and as its error, when not
+// connected, the try's error, what the try waits for or the connection; the
+// camera's last known recording status; what the last tap asked for while
+// the camera has yet to agree (null otherwise); the refusal of its last
+// command; and its picture: whether the camera's state says it can be
+// played, the running request (null when none) and whether it failed.
 const tiles = new Map();
 for (const el of document.querySelectorAll('.tile')) {
 	const img = el.querySelector('img'), video = el.querySelector('video');
@@ -216,7 +216,7 @@ events.onmessage = e => {
 	const t = tiles.get(s.name);
 	if (!t) return;
 	t.connection = s.connection;
-	t.fault = s.connection === 'connected' ? '' : s.error || (s.connection === 'connecting' ? 'connecting' : 'not connected');
+	t.fault = s.connection === 'connected' ? '' : s.error || (s.waiting ? 'waiting for ' + s.waiting : s.connection === 'connecting' ? 'connecting' : 'not connected');
 	if (s.connection === 'connected') t.failed = false;
 	t.playable = s.picture === true;
 	if ('recording' in s) {

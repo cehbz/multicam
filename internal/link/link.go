@@ -63,8 +63,11 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// Interfaces creates and deletes the radio's interfaces.
+// Interfaces awaits the radio and creates and deletes its interfaces.
 type Interfaces interface {
+	// AwaitRadio returns once the radio exists, at once if it does already,
+	// or with ctx's error once ctx ends.
+	AwaitRadio(ctx context.Context) error
 	Exists(name string) (bool, error)
 	// Add creates a station interface.
 	Add(name string) error
@@ -128,6 +131,10 @@ func newKeeper(ifaces Interfaces, sups Supplicants, net Network, lease func(cont
 		leaseTimeout: 10 * time.Second,
 	}
 }
+
+// AwaitRadio returns once the radio the links' interfaces are added to
+// exists, or with ctx's error once ctx ends.
+func (k *Keeper) AwaitRadio(ctx context.Context) error { return k.ifaces.AwaitRadio(ctx) }
 
 // Join brings up the link of c: a link already joined to c's network is
 // adopted; otherwise whatever is on the interface is left and the link joined

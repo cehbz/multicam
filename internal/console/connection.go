@@ -102,9 +102,10 @@ const leaveTimeout = 10 * time.Second
 
 // connection is the server's connection to its cameras: Connected or
 // Disconnected, as the user last asked and the state file keeps. While
-// Connected each camera gets one try to come up (its link joined, if it has
-// one, then watched), and one more each time it drops; a camera that does not
-// come up stays down until the next Connect. Disconnected, nothing is tried.
+// Connected each camera gets one try to come up (once its precondition, if it
+// has one, holds: its link joined, if it has one, then watched), and one more
+// each time it drops; a camera that does not come up stays down until the
+// next Connect. Disconnected, nothing is tried.
 type connection struct {
 	board *console // where the cameras' states and the server's are shown
 	saved StateFile
@@ -396,9 +397,14 @@ func (u *upCamera) down() {
 // errWatchEnded is the drop of a camera whose watch ended.
 var errWatchEnded = errors.New("watch ended")
 
-// try brings cc up once: its link joined, one join at a time, then its
-// watch started and its first status read.
+// try brings cc up once, once its precondition holds: its link joined, one
+// join at a time, then its watch started and its first status read.
 func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, error) {
+	if p := cc.Precondition; p != nil {
+		if err := n.await(session, cc, p); err != nil {
+			return nil, err
+		}
+	}
 	u := &upCamera{}
 	if cc.Link != nil {
 		select {
@@ -438,6 +444,20 @@ func (n *connection) try(session context.Context, cc *cameraConn) (*upCamera, er
 		u.down()
 		return nil, session.Err()
 	}
+}
+
+// await waits for p, cc's precondition, cc shown waiting for it meanwhile.
+func (n *connection) await(session context.Context, cc *cameraConn, p Precondition) error {
+	n.mu.Lock()
+	n.set(cc, state{Connection: connecting, Waiting: p.String()})
+	n.mu.Unlock()
+	if err := p.Wait(session); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	n.set(cc, state{Connection: connecting})
+	n.mu.Unlock()
+	return nil
 }
 
 // follow shows u's statuses until it drops, its link lost or its watch ended,

@@ -9,6 +9,7 @@ require (
 	github.com/mdlayher/genetlink v1.4.0
 	github.com/mdlayher/netlink v1.11.2
 	github.com/vishvananda/netlink v1.3.1
+	golang.org/x/sys v0.45.0
 )
 
 require (
@@ -21,5 +22,4 @@ require (
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 )

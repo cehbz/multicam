@@ -81,6 +81,13 @@ func (f *fake) Exists(name string) (bool, error) {
 	return f.ifaces[name], nil
 }
 
+func (f *fake) AwaitRadio(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("await radio")
+	return nil
+}
+
 func (f *fake) Add(name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -286,6 +293,16 @@ func assertNone(t *testing.T, ops []string, prefixes ...string) {
 				t.Errorf("unexpected op %q", op)
 			}
 		}
+	}
+}
+
+func TestKeeperAwaitsItsRadio(t *testing.T) {
+	f := newFake()
+	if err := f.keeper().AwaitRadio(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.opsSnapshot(); !slices.Equal(got, []string{"await radio"}) {
+		t.Errorf("ops %v, want the radio awaited", got)
 	}
 }
 

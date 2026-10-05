@@ -83,12 +83,24 @@ type Camera interface {
 }
 
 // Named is a camera as the console shows it: under its name, which also keys
-// its routes, with its picture, and its link when it has one of its own.
+// its routes, with its picture, its link when it has one of its own, and
+// what its try waits for when anything.
 type Named struct {
 	Name string
 	Picture
 	Camera
-	Link Link // nil when the camera is reached without one
+	Link         Link         // nil when the camera is reached without one
+	Precondition Precondition // nil when its try waits for nothing
+}
+
+// Precondition is what must hold outside the server before a camera can be
+// tried, such as the phone's Wi-Fi being up.
+type Precondition interface {
+	// Wait returns once the precondition holds, at once if it does already,
+	// or with ctx's error once ctx ends.
+	Wait(ctx context.Context) error
+	// String names what is awaited, as "waiting for" it on the camera's tile.
+	String() string
 }
 
 // connState is a camera's connection, or the server's: disconnected,
@@ -101,14 +113,16 @@ const (
 	connected    connState = "connected"
 )
 
-// state is one camera's state as the page gets it: its connection, whether
-// it is recording and whether its picture can be played (both known only
-// while connected), and the error of its last try to connect or of a
-// command. A streamed picture can be played while the camera's watch says
-// so, a relayed one while its feed delivers frames.
+// state is one camera's state as the page gets it: its connection, what its
+// try waits for while it waits, whether it is recording and whether its
+// picture can be played (both known only while connected), and the error of
+// its last try to connect or of a command. A streamed picture can be played
+// while the camera's watch says so, a relayed one while its feed delivers
+// frames.
 type state struct {
 	Name       string    `json:"name"`
 	Connection connState `json:"connection"`
+	Waiting    string    `json:"waiting,omitempty"`
 	Recording  *bool     `json:"recording,omitempty"`
 	Picture    bool      `json:"picture,omitempty"`
 	Error      string    `json:"error,omitempty"`
@@ -116,7 +130,7 @@ type state struct {
 
 // same reports whether s and o are the same state.
 func (s state) same(o state) bool {
-	if s.Name != o.Name || s.Connection != o.Connection || s.Picture != o.Picture || s.Error != o.Error || (s.Recording == nil) != (o.Recording == nil) {
+	if s.Name != o.Name || s.Connection != o.Connection || s.Waiting != o.Waiting || s.Picture != o.Picture || s.Error != o.Error || (s.Recording == nil) != (o.Recording == nil) {
 		return false
 	}
 	return s.Recording == nil || *s.Recording == *o.Recording

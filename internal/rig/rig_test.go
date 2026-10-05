@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -127,7 +128,7 @@ var exampleCameras = []camera{
 		b.StartGap = 3 * time.Second
 		return b
 	}()},
-	{"pixel9", blackmagicPhone{"192.168.1.109:4444"}},
+	{"pixel9", blackmagicPhone{"192.168.1.108:4444"}},
 }
 
 func TestExampleConfig(t *testing.T) {
@@ -328,6 +329,26 @@ func TestBlackmagicPhoneIsStreamedUnderItsName(t *testing.T) {
 	}
 }
 
+func TestBlackmagicPhoneWaitsForARouteToItsAddress(t *testing.T) {
+	cam, err := blackmagicPhone{Address: "192.168.1.9:4444"}.open("pixel9", noKeeper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (route{addr: netip.MustParseAddr("192.168.1.9")}); cam.Precondition != want {
+		t.Fatalf("precondition %#v, want %#v", cam.Precondition, want)
+	}
+	if got := cam.Precondition.String(); got != "network" {
+		t.Errorf("String = %q, want network", got)
+	}
+	named, err := blackmagicPhone{Address: "pixel9.lan:4444"}.open("pixel9", noKeeper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if named.Precondition != nil {
+		t.Errorf("precondition of a named host %#v, want none", named.Precondition)
+	}
+}
+
 // phoneApp is Blackmagic Camera's HTTP server as a watch uses it: idle, and
 // pushing each of statuses as its livestream's status once subscribed.
 func phoneApp(t *testing.T, statuses ...string) string {
@@ -461,11 +482,18 @@ func TestLoadKeepsTheStateBesideTheConfigByDefault(t *testing.T) {
 	}
 }
 
-// fakeKeeper records the links it is asked to join and leave.
+// fakeKeeper records the links it is asked to join and leave, and its
+// radio's waits.
 type fakeKeeper struct {
-	joined []link.Config
-	left   []string
-	err    error
+	joined     []link.Config
+	left       []string
+	radioWaits int
+	err        error
+}
+
+func (k *fakeKeeper) AwaitRadio(context.Context) error {
+	k.radioWaits++
+	return k.err
 }
 
 func (k *fakeKeeper) Join(_ context.Context, c link.Config) (*link.Link, error) {
@@ -505,6 +533,30 @@ func TestBodyOnAnInterfaceOpensWithItsLink(t *testing.T) {
 	want := sonyLink{keeper: k, config: link.Config{Interface: "cam2", Network: "DIRECT-b", Password: "pb", Table: 2002}}
 	if cam.Link != want {
 		t.Errorf("link %#v, want %#v", cam.Link, want)
+	}
+	if want := (wifi{keeper: k, body: "rx100m6"}); cam.Precondition != want {
+		t.Errorf("precondition %#v, want %#v", cam.Precondition, want)
+	}
+}
+
+func TestWifiIsTheKeepersRadioNamedForTheBody(t *testing.T) {
+	k := &fakeKeeper{err: errors.New("open /sys/class/ieee80211/phy0/index: no such file or directory")}
+	w := wifi{keeper: k, body: "rx10m4"}
+	if err := w.Wait(t.Context()); err != k.err || k.radioWaits != 1 {
+		t.Errorf("Wait = %v after %d radio waits; want the keeper's one wait and its error", err, k.radioWaits)
+	}
+	if got := w.String(); got != "rx10m4 wifi" {
+		t.Errorf("String = %q, want rx10m4 wifi", got)
+	}
+}
+
+func TestSonyBodyWithoutAnInterfaceWaitsForNothing(t *testing.T) {
+	cam, err := sonyBody{Endpoint: sony.DefaultEndpoint}.open("body", noKeeper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cam.Precondition != nil {
+		t.Errorf("precondition %#v, want none", cam.Precondition)
 	}
 }
 

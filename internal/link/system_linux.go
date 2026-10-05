@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/netip"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/mdlayher/genetlink"
 	"github.com/mdlayher/netlink"
 	rtnl "github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // rulePriority is the priority of each link's routing rule: below netd's
@@ -57,9 +59,69 @@ func (System) Exists(name string) (bool, error) {
 	return err == nil, err
 }
 
+// radioIndex is the radio's index file, there once the radio exists.
+func (s System) radioIndex() string { return "/sys/class/ieee80211/" + s.Phy + "/index" }
+
+// AwaitRadio returns once the radio exists, checked at each uevent the
+// kernel sends, or with ctx's error once ctx ends.
+func (s System) AwaitRadio(ctx context.Context) error {
+	return await(ctx, unix.NETLINK_KOBJECT_UEVENT, 1, func() (bool, error) {
+		_, err := os.Stat(s.radioIndex())
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return err == nil, err
+	})
+}
+
+// AwaitRoute returns once the phone has a route to dst, an IPv4 address,
+// checked at each change of its links, IPv4 addresses, routes and rules, or
+// with ctx's error once ctx ends.
+func AwaitRoute(ctx context.Context, dst netip.Addr) error {
+	groups := uint32(unix.RTMGRP_LINK | unix.RTMGRP_IPV4_IFADDR | unix.RTMGRP_IPV4_ROUTE | unix.RTMGRP_IPV4_RULE)
+	return await(ctx, unix.NETLINK_ROUTE, groups, func() (bool, error) {
+		_, err := rtnl.RouteGet(dst.AsSlice())
+		if errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH) {
+			return false, nil
+		}
+		return err == nil, err
+	})
+}
+
+// await returns once holds reports true, checked at once and again at each
+// message the kernel sends to groups of the netlink protocol, or with ctx's
+// error once ctx ends.
+func await(ctx context.Context, protocol int, groups uint32, holds func() (bool, error)) error {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, protocol)
+	if err != nil {
+		return err
+	}
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK, Groups: groups}); err != nil {
+		unix.Close(fd)
+		return err
+	}
+	events := os.NewFile(uintptr(fd), "netlink")
+	defer events.Close()
+	defer context.AfterFunc(ctx, func() { events.Close() })()
+	msg := make([]byte, 1<<16)
+	for {
+		if ok, err := holds(); ok || err != nil {
+			return err
+		}
+		// A full socket buffer drops messages, and is followed by a check
+		// like any message.
+		if _, err := events.Read(msg); err != nil && !errors.Is(err, unix.ENOBUFS) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+	}
+}
+
 // Add creates a station interface on the radio.
 func (s System) Add(name string) error {
-	b, err := os.ReadFile("/sys/class/ieee80211/" + s.Phy + "/index")
+	b, err := os.ReadFile(s.radioIndex())
 	if err != nil {
 		return err
 	}

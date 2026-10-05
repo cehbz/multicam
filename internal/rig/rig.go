@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -89,7 +90,8 @@ const firstTable = 2001
 // body's network name and password, which a body on an interface needs, its
 // camera service endpoint (sony.DefaultEndpoint when left out) and the gap a
 // start keeps after the body reports IDLE (start_gap, a duration; none when
-// left out). Its link's route is in Table, one per body on an interface. The
+// left out). Its link's route is in Table, one per body on an interface, and
+// a try of a body on an interface waits for the phone's Wi-Fi radio. The
 // console relays its liveview.
 type sonyBody struct {
 	Interface string
@@ -113,12 +115,15 @@ func (b sonyBody) open(name string, keeper func() (*link.Keeper, error)) (consol
 			return console.Named{}, err
 		}
 		named.Link = sonyLink{keeper: k, config: link.Config{Interface: b.Interface, Network: b.Network, Password: b.Password, Table: b.Table}}
+		named.Precondition = wifi{keeper: k, body: name}
 	}
 	return named, nil
 }
 
-// keeper joins and leaves the Sony bodies' links, as a *link.Keeper does.
+// keeper joins and leaves the Sony bodies' links, and awaits the radio
+// they are added to, as a *link.Keeper does.
 type keeper interface {
+	AwaitRadio(ctx context.Context) error
 	Join(ctx context.Context, c link.Config) (*link.Link, error)
 	Leave(ctx context.Context, iface string) error
 }
@@ -138,6 +143,23 @@ func (l sonyLink) Join(ctx context.Context) (console.Joined, error) {
 }
 
 func (l sonyLink) Leave(ctx context.Context) error { return l.keeper.Leave(ctx, l.config.Interface) }
+
+// wifi is the phone's Wi-Fi radio as a Sony body's try awaits it, named for
+// the body.
+type wifi struct {
+	keeper keeper
+	body   string
+}
+
+func (w wifi) Wait(ctx context.Context) error { return w.keeper.AwaitRadio(ctx) }
+func (w wifi) String() string                 { return w.body + " wifi" }
+
+// route is the phone's route to a camera's address, as the camera's try
+// awaits it.
+type route struct{ addr netip.Addr }
+
+func (r route) Wait(ctx context.Context) error { return link.AwaitRoute(ctx, r.addr) }
+func (route) String() string                   { return "network" }
 
 // watch is a camera's watch as the console takes it: each delivery of
 // source's watch as status gives it, until that watch ends or ctx does.
@@ -183,14 +205,20 @@ func (c blackmagicCamera) Watch(ctx context.Context) (<-chan console.Status, err
 
 // blackmagicPhone is a phone running Blackmagic Camera (kind "blackmagic"):
 // the address of the app's HTTP server. Its picture is the app's livestream,
-// which the page plays from MediaMTX under the camera's name.
+// which the page plays from MediaMTX under the camera's name. A try waits for
+// a route to the address when its host is an IP address.
 type blackmagicPhone struct {
 	Address string
 }
 
 func (p blackmagicPhone) open(name string, _ func() (*link.Keeper, error)) (console.Named, error) {
 	cam := blackmagic.NewCamera(p.Address)
-	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: blackmagicCamera{cam}}, nil
+	named := console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: blackmagicCamera{cam}}
+	host, _, _ := net.SplitHostPort(p.Address)
+	if addr, err := netip.ParseAddr(host); err == nil {
+		named.Precondition = route{addr: addr}
+	}
+	return named, nil
 }
 
 // settings is the keys of one [[camera]] table. take removes the ones read;

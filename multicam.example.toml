@@ -47,4 +47,4 @@ start_gap = "3s"
 [[camera]]
 name = "pixel9"
 kind = "blackmagic"
-address = "192.168.1.109:4444"
+address = "192.168.1.108:4444"
