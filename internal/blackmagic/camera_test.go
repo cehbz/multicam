@@ -37,7 +37,7 @@ type fake struct {
 
 	// pushes are record states and streamPushes livestream statuses, each
 	// with its own bitrate, delivered on the event socket after the
-	// subscribe request in that order; subscribed receives the subscribe
+	// subscribe response in that order; subscribed receives the subscribe
 	// request's JSON.
 	pushes       []bool
 	streamPushes []string
@@ -127,7 +127,8 @@ func (f *fake) platform(w http.ResponseWriter, r *http.Request, name string) {
 }
 
 // events is the notification socket: it announces itself, takes the
-// subscribe request, acknowledges it and pushes each of pushes.
+// subscribe request, answers it with the current recording and livestream
+// status, and pushes each of pushes and streamPushes.
 func (f *fake) events(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
@@ -141,8 +142,16 @@ func (f *fake) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.subscribed <- raw
+	f.mu.Lock()
+	recording, livestream := f.recording, f.livestream
+	f.mu.Unlock()
 	wsjson.Write(ctx, conn, map[string]any{"type": "response", "data": map[string]any{
-		"action": "subscribe", "properties": []string{RecordPath}, "success": true}})
+		"action": "subscribe",
+		"values": map[string]any{
+			RecordPath:     map[string]any{"recording": recording},
+			LivestreamPath: map[string]any{"status": livestream, "bitrate": 0, "effectiveVideoFormat": "1920x1080p25", "duration": 0, "cache": 0.0},
+		},
+		"properties": []string{RecordPath, LivestreamPath}, "success": true}})
 	for _, v := range f.pushes {
 		wsjson.Write(ctx, conn, map[string]any{"type": "event", "data": map[string]any{
 			"action": "propertyValueChanged", "property": RecordPath, "value": map[string]any{"recording": v}}})
@@ -324,32 +333,77 @@ func TestWatchFailsWhenStateUnreadable(t *testing.T) {
 	}
 }
 
-func TestWatchStartsTheLivestreamWhenItTurnsIdle(t *testing.T) {
-	f := newFake(t)
-	f.streamPushes = []string{"Idle", "Connecting", "Streaming", "Idle", "Idle", "Idle", "Streaming"}
-	ch, err := NewCamera(f.Address()).Watch(t.Context())
-	if err != nil {
-		t.Fatal(err)
+// Starts is the number of livestream start calls the fake has had.
+func (f *fake) Starts() int {
+	n := 0
+	for _, c := range f.Calls() {
+		if c == "PUT "+LivestreamStartPath {
+			n++
+		}
 	}
+	return n
+}
+
+// startsReach waits up to 5 s for the fake's start calls to reach n, then
+// 100 ms for any more, and returns the count.
+func startsReach(f *fake, n int) int {
+	for deadline := time.Now().Add(5 * time.Second); f.Starts() < n && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	return f.Starts()
+}
+
+// drain discards each state ch delivers.
+func drain(ch <-chan State) {
 	go func() {
 		for range ch {
 		}
 	}()
-	starts := func() int {
-		n := 0
-		for _, c := range f.Calls() {
-			if c == "PUT /livestreams/0/start" {
-				n++
-			}
-		}
-		return n
+}
+
+func TestWatchStartsTheLivestreamWhenItTurnsIdle(t *testing.T) {
+	f := newFake(t)
+	f.streamPushes = []string{"Connecting", "Streaming", "Idle", "Idle", "Idle", "Streaming"}
+	ch, err := NewCamera(f.Address()).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for deadline := time.Now().Add(5 * time.Second); starts() < 2 && time.Now().Before(deadline); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	time.Sleep(100 * time.Millisecond)
-	if n := starts(); n != 2 {
+	drain(ch)
+	if n := startsReach(f, 2); n != 2 {
 		t.Errorf("livestream started %d times, want 2 (calls %v)", n, f.Calls())
+	}
+}
+
+// The app answers the subscribe request with the current status and pushes
+// nothing more while nothing changes.
+func TestWatchStartsAnIdleLivestreamOnSubscribing(t *testing.T) {
+	f := newFake(t)
+	ch, err := NewCamera(f.Address()).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(ch)
+	if n := startsReach(f, 1); n != 1 {
+		t.Errorf("livestream started %d times, want 1 (calls %v)", n, f.Calls())
+	}
+}
+
+func TestWatchIsStreamingWhenTheLivestreamStreamsOnSubscribing(t *testing.T) {
+	f := newFake(t)
+	f.recording = true
+	f.livestream = StatusStreaming
+	ch, err := NewCamera(f.Address()).Watch(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []State{{Recording: true}, {Recording: true, Streaming: true}}
+	if got := receive(t, ch, len(want)); !slices.Equal(got, want) {
+		t.Errorf("states %v, want %v", got, want)
+	}
+	quiet(t, ch)
+	if n := f.Starts(); n != 0 {
+		t.Errorf("a streaming livestream started %d times (calls %v)", n, f.Calls())
 	}
 }
 

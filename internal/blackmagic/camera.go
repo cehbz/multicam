@@ -141,24 +141,38 @@ type State struct {
 	Streaming bool
 }
 
-// eventMessage is one message from the notification socket; only
-// propertyValueChanged events carry a value.
+// eventMessage is one message from the notification socket: a
+// propertyValueChanged event carries one property's value, the subscribe
+// response each subscribed property's current value.
 type eventMessage struct {
 	Type string `json:"type"`
 	Data struct {
-		Action   string          `json:"action"`
-		Property string          `json:"property"`
-		Value    json.RawMessage `json:"value"`
+		Action   string                     `json:"action"`
+		Property string                     `json:"property"`
+		Value    json.RawMessage            `json:"value"`
+		Values   map[string]json.RawMessage `json:"values"`
 	} `json:"data"`
 }
 
-// Watch reports the camera's state as the camera pushes it: the recording
-// state read over REST, not streaming, first, then each change of either from
-// the notification socket. The livestream is streaming while its pushed
-// status is Streaming. The channel closes when ctx ends or the socket drops.
-// While it watches, it starts the livestream whenever its pushed status turns
-// Idle; the app pushes the status on subscribing, so a stream not running
-// when the watch begins is started.
+// values is the property values m carries: the one a propertyValueChanged
+// event pushes, or those the subscribe response reports.
+func (m eventMessage) values() map[string]json.RawMessage {
+	switch {
+	case m.Type == "event" && m.Data.Action == "propertyValueChanged":
+		return map[string]json.RawMessage{m.Data.Property: m.Data.Value}
+	case m.Type == "response" && m.Data.Action == "subscribe":
+		return m.Data.Values
+	}
+	return nil
+}
+
+// Watch reports the camera's state: the recording state read over REST, not
+// streaming, first, then each change of either from the notification socket,
+// which reports both on subscribing and pushes each change after. The
+// livestream is streaming while its status is Streaming. The channel closes
+// when ctx ends or the socket drops. While it watches, the livestream runs:
+// it is started when the status reported on subscribing is Idle and whenever
+// a pushed status turns Idle.
 func (c *Camera) Watch(ctx context.Context) (<-chan State, error) {
 	conn, _, err := websocket.Dial(ctx, c.url("wss", EventPath), &websocket.DialOptions{HTTPClient: c.http})
 	if err != nil {
@@ -199,29 +213,28 @@ func (c *Camera) Watch(ctx context.Context) (<-chan State, error) {
 			if err := wsjson.Read(ctx, conn, &m); err != nil {
 				return
 			}
-			if m.Type != "event" || m.Data.Action != "propertyValueChanged" {
-				continue
-			}
 			next := delivered
-			switch m.Data.Property {
-			case RecordPath:
-				var r record
-				if err := json.Unmarshal(m.Data.Value, &r); err != nil {
-					continue
-				}
-				next.Recording = r.Recording
-			case LivestreamPath:
-				var ls livestream
-				if err := json.Unmarshal(m.Data.Value, &ls); err != nil {
-					continue
-				}
-				if ls.Status == StatusIdle && status != StatusIdle {
-					if _, err := c.call(ctx, http.MethodPut, LivestreamStartPath); err != nil && ctx.Err() == nil {
-						slog.Error("livestream", "err", err)
+			for property, value := range m.values() {
+				switch property {
+				case RecordPath:
+					var r record
+					if err := json.Unmarshal(value, &r); err != nil {
+						continue
 					}
+					next.Recording = r.Recording
+				case LivestreamPath:
+					var ls livestream
+					if err := json.Unmarshal(value, &ls); err != nil {
+						continue
+					}
+					if ls.Status == StatusIdle && status != StatusIdle {
+						if _, err := c.call(ctx, http.MethodPut, LivestreamStartPath); err != nil && ctx.Err() == nil {
+							slog.Error("livestream", "err", err)
+						}
+					}
+					status = ls.Status
+					next.Streaming = ls.Status == StatusStreaming
 				}
-				status = ls.Status
-				next.Streaming = ls.Status == StatusStreaming
 			}
 			if next == delivered {
 				continue
