@@ -567,6 +567,17 @@ func TestPageBarHasTheMenuTheDotTheAllButtonsAndReload(t *testing.T) {
 	}
 }
 
+// The page is the viewport's height, which html's 100% is in the installed
+// app; 100dvh there is 56 px taller, which put the last tile's bottom, its
+// error with it, off the screen.
+func TestPageIsTheViewportsHeight(t *testing.T) {
+	_, _, console := twoCameras(t)
+	page := get(console, "/").Body.String()
+	if !strings.Contains(page, "html, body { height: 100%; margin: 0 }") || strings.Contains(page, "dvh") {
+		t.Errorf("page height is not the viewport's: %q", page)
+	}
+}
+
 // The page loads quiescent: shown disconnected, with no picture requested
 // until its camera reports connected.
 func TestPageRequestsNoPictureOnLoad(t *testing.T) {
