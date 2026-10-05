@@ -7,7 +7,14 @@ Design and findings: KB node `projects/multicam.md`.
    the Sony bodies off, the Pixel 9 locked with Blackmagic Camera closed;
    then open the app, turn everything on and Connect. Check that the
    supervisor started at boot and the server restored its saved state.
-   End with Stop all, then Disconnect.
+   End with Stop all, then Disconnect. Open from the first reboot test:
+   - Debug the Sony interface adds failing at boot (`add interface: netlink
+     receive: resource temporarily unavailable`, while the Wi-Fi driver
+     was starting): on a boot, time the add attempts to the millisecond
+     against dmesg.
+   - Decide what a Sony try does when its body is asleep and its network
+     is off the air: today the join fails with
+     `P2P-GROUP-FORMATION-FAILURE` and the camera stays Disconnected.
 1. Clip-end restart: a Sony body whose status goes from `MovieRecording`
    to `IDLE` without a stop from the console is started again, after its
    gap. Sony stops a clip at about 29 minutes.
