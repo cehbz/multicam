@@ -305,3 +305,14 @@ func TestWatchStartsTheLivestreamWhenItTurnsIdle(t *testing.T) {
 		t.Errorf("livestream started %d times, want 2 (calls %v)", n, f.Calls())
 	}
 }
+
+func TestAdvertisedMatchesTheAppsUniqueID(t *testing.T) {
+	txt := []string{"device name=Google Pixel 9 Pro XL", "capabilities=cameraControl", "txtvers=1",
+		"unique id=b722b4654dc94e5dbb76a30055bf6a72", "path=/control/api/v1", "camera name=A"}
+	if !Advertised("b722b4654dc94e5dbb76a30055bf6a72")(txt) {
+		t.Errorf("the app's TXT doesn't match its unique id")
+	}
+	if Advertised("0000")(txt) {
+		t.Errorf("the app's TXT matches another unique id")
+	}
+}

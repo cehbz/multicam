@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/coder/websocket"
@@ -217,4 +218,14 @@ func (c *Camera) Watch(ctx context.Context) (<-chan State, error) {
 		}
 	}()
 	return ch, nil
+}
+
+// Service is the DNS-SD service type the app advertises its HTTP server
+// under.
+const Service = "_http._tcp.local."
+
+// Advertised reports whether txt, the TXT strings of an instance of Service,
+// are the app's with the unique id id.
+func Advertised(id string) func(txt []string) bool {
+	return func(txt []string) bool { return slices.Contains(txt, "unique id="+id) }
 }

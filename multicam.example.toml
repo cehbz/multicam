@@ -42,9 +42,11 @@ password = "password"
 start_gap = "3s"
 
 # The Pixel 9, driven through Blackmagic Camera's HTTP server on the home
-# LAN; its picture is the app's livestream, received by MediaMTX on this
-# phone under the camera's name.
+# LAN, found over mDNS on interface by id, the app's unique id (the
+# "unique id" in its _http._tcp TXT record); its picture is the app's
+# livestream, received by MediaMTX on this phone under the camera's name.
 [[camera]]
 name = "pixel9"
 kind = "blackmagic"
-address = "192.168.1.108:4444"
+id = "b722b4654dc94e5dbb76a30055bf6a72"
+interface = "wlan0"

@@ -43,11 +43,11 @@ func TestParse(t *testing.T) {
 		{
 			name: "two Sony bodies on their links, each with its own table",
 			text: "[[camera]]\nname = \"rx10m4\"\nkind = \"sony\"\ninterface = \"wlan1\"\nnetwork = \"DIRECT-a\"\npassword = \"pa\"\n" +
-				"[[camera]]\nname = \"pixel9\"\nkind = \"blackmagic\"\naddress = \"192.168.1.9:4444\"\n" +
+				"[[camera]]\nname = \"pixel9\"\nkind = \"blackmagic\"\nid = \"b722\"\ninterface = \"wlan0\"\n" +
 				"[[camera]]\nname = \"rx100m6\"\nkind = \"sony\"\ninterface = \"cam2\"\nnetwork = \"DIRECT-b\"\npassword = \"pb\"\nstart_gap = \"3s\"\n",
 			want: []camera{
 				{"rx10m4", onLink("wlan1", "DIRECT-a", "pa", 2001)},
-				{"pixel9", blackmagicPhone{"192.168.1.9:4444"}},
+				{"pixel9", blackmagicPhone{ID: "b722", Interface: "wlan0"}},
 				{"rx100m6", func() sonyBody { b := onLink("cam2", "DIRECT-b", "pb", 2002); b.StartGap = 3 * time.Second; return b }()},
 			},
 		},
@@ -65,11 +65,13 @@ func TestParse(t *testing.T) {
 			wantErr: `camera 2 (b): interface "wlan1" is already camera 1's`,
 		},
 		{
-			name: "Blackmagic camera at its address",
-			text: "[[camera]]\nname = \"pixel9\"\nkind = \"blackmagic\"\naddress = \"192.168.1.9:4444\"\n",
-			want: []camera{{"pixel9", blackmagicPhone{"192.168.1.9:4444"}}},
+			name: "Blackmagic camera by its id on an interface",
+			text: "[[camera]]\nname = \"pixel9\"\nkind = \"blackmagic\"\nid = \"b722\"\ninterface = \"wlan0\"\n",
+			want: []camera{{"pixel9", blackmagicPhone{ID: "b722", Interface: "wlan0"}}},
 		},
-		{name: "Blackmagic camera without an address", text: "[[camera]]\nname = \"a\"\nkind = \"blackmagic\"\n", wantErr: `camera 1 (a): address "" is not the phone's HTTP server address and port`},
+		{name: "Blackmagic camera without an id", text: "[[camera]]\nname = \"a\"\nkind = \"blackmagic\"\ninterface = \"wlan0\"\n", wantErr: "camera 1 (a): a Blackmagic camera needs its id and interface"},
+		{name: "Blackmagic camera without an interface", text: "[[camera]]\nname = \"a\"\nkind = \"blackmagic\"\nid = \"b722\"\n", wantErr: "camera 1 (a): a Blackmagic camera needs its id and interface"},
+		{name: "a Blackmagic camera's address is gone", text: "[[camera]]\nname = \"a\"\nkind = \"blackmagic\"\nid = \"b722\"\ninterface = \"wlan0\"\naddress = \"192.168.1.9:4444\"\n", wantErr: `camera 1 (a): unknown key "address"`},
 		{name: "start gap that is not a duration", text: "[[camera]]\nname = \"a\"\nkind = \"sony\"\nstart_gap = \"soon\"\n", wantErr: `camera 1 (a): start_gap "soon" is not a duration`},
 		{name: "no cameras", text: "", wantErr: "no cameras"},
 		{name: "camera without a name", text: "[[camera]]\nkind = \"sony\"\n", wantErr: "camera 1"},
@@ -128,7 +130,7 @@ var exampleCameras = []camera{
 		b.StartGap = 3 * time.Second
 		return b
 	}()},
-	{"pixel9", blackmagicPhone{"192.168.1.108:4444"}},
+	{"pixel9", blackmagicPhone{ID: "b722b4654dc94e5dbb76a30055bf6a72", Interface: "wlan0"}},
 }
 
 func TestExampleConfig(t *testing.T) {
@@ -317,7 +319,7 @@ func TestSonyBodyWatchFailureIsReturned(t *testing.T) {
 }
 
 func TestBlackmagicPhoneIsStreamedUnderItsName(t *testing.T) {
-	cam, err := blackmagicPhone{Address: "192.168.1.9:4444"}.open("pixel9", noKeeper)
+	cam, err := blackmagicPhone{ID: "b722", Interface: "wlan0"}.open("pixel9", noKeeper)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,23 +331,53 @@ func TestBlackmagicPhoneIsStreamedUnderItsName(t *testing.T) {
 	}
 }
 
-func TestBlackmagicPhoneWaitsForARouteToItsAddress(t *testing.T) {
-	cam, err := blackmagicPhone{Address: "192.168.1.9:4444"}.open("pixel9", noKeeper)
+func TestBlackmagicPhoneWaitsToBeFound(t *testing.T) {
+	cam, err := blackmagicPhone{ID: "b722", Interface: "wlan0"}.open("pixel9", noKeeper)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (route{addr: netip.MustParseAddr("192.168.1.9")}); cam.Precondition != want {
-		t.Fatalf("precondition %#v, want %#v", cam.Precondition, want)
+	if cam.Precondition == nil || any(cam.Precondition) != any(cam.Camera) {
+		t.Fatalf("precondition %#v, want the camera found", cam.Precondition)
 	}
-	if got := cam.Precondition.String(); got != "network" {
-		t.Errorf("String = %q, want network", got)
+	if got := cam.Precondition.String(); got != "Blackmagic Camera" {
+		t.Errorf("String = %q, want Blackmagic Camera", got)
 	}
-	named, err := blackmagicPhone{Address: "pixel9.lan:4444"}.open("pixel9", noKeeper)
-	if err != nil {
+}
+
+// foundAt is a find that finds the app at addr.
+func foundAt(t *testing.T, addr string) func(context.Context) (netip.AddrPort, error) {
+	ap := netip.MustParseAddrPort(addr)
+	return func(context.Context) (netip.AddrPort, error) { return ap, nil }
+}
+
+func TestBlackmagicCameraIsNotReachedBeforeItIsFound(t *testing.T) {
+	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t))}
+	if err := cam.StartRecording(t.Context()); err == nil || err.Error() != "Blackmagic Camera not found" {
+		t.Errorf("StartRecording = %v, want not found", err)
+	}
+	if ch, err := cam.Watch(t.Context()); err == nil {
+		t.Errorf("Watch = %v, %v; want not found", ch, err)
+	}
+}
+
+func TestBlackmagicCameraIsReachedWhereItWasFound(t *testing.T) {
+	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t))}
+	if err := cam.Wait(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if named.Precondition != nil {
-		t.Errorf("precondition of a named host %#v, want none", named.Precondition)
+	if err := cam.StartRecording(t.Context()); err != nil {
+		t.Errorf("StartRecording = %v", err)
+	}
+	if err := cam.StopRecording(t.Context()); err != nil {
+		t.Errorf("StopRecording = %v", err)
+	}
+}
+
+func TestBlackmagicCameraWaitEndsWithTheFindsError(t *testing.T) {
+	want := errors.New("listen udp4 0.0.0.0:5353: bind: permission denied")
+	cam := &blackmagicCamera{find: func(context.Context) (netip.AddrPort, error) { return netip.AddrPort{}, want }}
+	if err := cam.Wait(t.Context()); err != want {
+		t.Errorf("Wait = %v, want %v", err, want)
 	}
 }
 
@@ -380,8 +412,8 @@ func phoneApp(t *testing.T, statuses ...string) string {
 }
 
 func TestBlackmagicPhonesPictureCanBePlayedWhileItStreams(t *testing.T) {
-	cam, err := blackmagicPhone{Address: phoneApp(t, "Connecting", "Streaming", "Idle")}.open("pixel9", noKeeper)
-	if err != nil {
+	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t, "Connecting", "Streaming", "Idle"))}
+	if err := cam.Wait(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -473,7 +505,7 @@ func TestParseTables(t *testing.T) {
 func TestLoadKeepsTheStateBesideTheConfigByDefault(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "multicam.toml")
-	if err := os.WriteFile(path, []byte("[[camera]]\nname = \"p\"\nkind = \"blackmagic\"\naddress = \"127.0.0.1:1\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("[[camera]]\nname = \"p\"\nkind = \"blackmagic\"\nid = \"b722\"\ninterface = \"wlan0\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	r, err := Load(path)
@@ -562,7 +594,7 @@ func TestSonyBodyWithoutAnInterfaceWaitsForNothing(t *testing.T) {
 
 func TestLoadHandsOverMediaMTX(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "multicam.toml")
-	config := "[mediamtx]\npath = \"/x/mediamtx\"\n[[camera]]\nname = \"p\"\nkind = \"blackmagic\"\naddress = \"127.0.0.1:1\"\n"
+	config := "[mediamtx]\npath = \"/x/mediamtx\"\n[[camera]]\nname = \"p\"\nkind = \"blackmagic\"\nid = \"b722\"\ninterface = \"wlan0\"\n"
 	if err := os.WriteFile(path, []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}

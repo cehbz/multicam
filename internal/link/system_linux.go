@@ -74,20 +74,6 @@ func (s System) AwaitRadio(ctx context.Context) error {
 	})
 }
 
-// AwaitRoute returns once the phone has a route to dst, an IPv4 address,
-// checked at each change of its links, IPv4 addresses, routes and rules, or
-// with ctx's error once ctx ends.
-func AwaitRoute(ctx context.Context, dst netip.Addr) error {
-	groups := uint32(unix.RTMGRP_LINK | unix.RTMGRP_IPV4_IFADDR | unix.RTMGRP_IPV4_ROUTE | unix.RTMGRP_IPV4_RULE)
-	return await(ctx, unix.NETLINK_ROUTE, groups, func() (bool, error) {
-		_, err := rtnl.RouteGet(dst.AsSlice())
-		if errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH) {
-			return false, nil
-		}
-		return err == nil, err
-	})
-}
-
 // await returns once holds reports true, checked at once and again at each
 // message the kernel sends to groups of the netlink protocol, or with ctx's
 // error once ctx ends.

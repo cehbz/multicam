@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 	"github.com/cehbz/multicam/internal/blackmagic"
 	"github.com/cehbz/multicam/internal/console"
 	"github.com/cehbz/multicam/internal/link"
+	"github.com/cehbz/multicam/internal/mdns"
 	"github.com/cehbz/multicam/internal/mediamtx"
 	"github.com/cehbz/multicam/internal/sony"
 )
@@ -154,13 +154,6 @@ type wifi struct {
 func (w wifi) Wait(ctx context.Context) error { return w.keeper.AwaitRadio(ctx) }
 func (w wifi) String() string                 { return w.body + " wifi" }
 
-// route is the phone's route to a camera's address, as the camera's try
-// awaits it.
-type route struct{ addr netip.Addr }
-
-func (r route) Wait(ctx context.Context) error { return link.AwaitRoute(ctx, r.addr) }
-func (route) String() string                   { return "network" }
-
 // watch is a camera's watch as the console takes it: each delivery of
 // source's watch as status gives it, until that watch ends or ctx does.
 func watch[T any](ctx context.Context, source func(context.Context) (<-chan T, error), status func(T) console.Status) (<-chan console.Status, error) {
@@ -193,32 +186,92 @@ func (c sonyCamera) Watch(ctx context.Context) (<-chan console.Status, error) {
 	})
 }
 
-// blackmagicCamera is a phone running Blackmagic Camera as the console
-// watches it: its picture playable while its livestream is streaming.
-type blackmagicCamera struct{ *blackmagic.Camera }
+// errNotFound is a command to a Blackmagic Camera not yet found.
+var errNotFound = errors.New("Blackmagic Camera not found")
 
-func (c blackmagicCamera) Watch(ctx context.Context) (<-chan console.Status, error) {
-	return watch(ctx, c.Camera.Watch, func(s blackmagic.State) console.Status {
+// blackmagicCamera is a phone running Blackmagic Camera as the console
+// watches it: its try awaits finding the app's HTTP server on the network
+// with find, and it is reached at the address found last; its picture is
+// playable while its livestream is streaming.
+type blackmagicCamera struct {
+	find func(ctx context.Context) (netip.AddrPort, error)
+
+	mu   sync.Mutex
+	addr netip.AddrPort     // where it was found last
+	cam  *blackmagic.Camera // the server at addr; nil until found
+}
+
+// Wait returns once the app is found, or with find's error.
+func (c *blackmagicCamera) Wait(ctx context.Context) error {
+	addr, err := c.find(ctx)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cam == nil || addr != c.addr {
+		c.addr, c.cam = addr, blackmagic.NewCamera(addr.String())
+	}
+	return nil
+}
+
+func (*blackmagicCamera) String() string { return "Blackmagic Camera" }
+
+// found is the app's HTTP server where it was found last.
+func (c *blackmagicCamera) found() (*blackmagic.Camera, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cam == nil {
+		return nil, errNotFound
+	}
+	return c.cam, nil
+}
+
+func (c *blackmagicCamera) StartRecording(ctx context.Context) error {
+	cam, err := c.found()
+	if err != nil {
+		return err
+	}
+	return cam.StartRecording(ctx)
+}
+
+func (c *blackmagicCamera) StopRecording(ctx context.Context) error {
+	cam, err := c.found()
+	if err != nil {
+		return err
+	}
+	return cam.StopRecording(ctx)
+}
+
+func (c *blackmagicCamera) Watch(ctx context.Context) (<-chan console.Status, error) {
+	cam, err := c.found()
+	if err != nil {
+		return nil, err
+	}
+	return watch(ctx, cam.Watch, func(s blackmagic.State) console.Status {
 		return console.Status{Recording: s.Recording, Picture: s.Streaming}
 	})
 }
 
 // blackmagicPhone is a phone running Blackmagic Camera (kind "blackmagic"):
-// the address of the app's HTTP server. Its picture is the app's livestream,
-// which the page plays from MediaMTX under the camera's name. A try waits for
-// a route to the address when its host is an IP address.
+// the app's unique id and the interface its HTTP server is found on over
+// mDNS. Its picture is the app's livestream, which the page plays from
+// MediaMTX under the camera's name.
 type blackmagicPhone struct {
-	Address string
+	ID        string
+	Interface string
 }
 
 func (p blackmagicPhone) open(name string, _ func() (*link.Keeper, error)) (console.Named, error) {
-	cam := blackmagic.NewCamera(p.Address)
-	named := console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: blackmagicCamera{cam}}
-	host, _, _ := net.SplitHostPort(p.Address)
-	if addr, err := netip.ParseAddr(host); err == nil {
-		named.Precondition = route{addr: addr}
-	}
-	return named, nil
+	cam := &blackmagicCamera{find: func(ctx context.Context) (netip.AddrPort, error) {
+		conn, err := mdns.Listen(p.Interface)
+		if err != nil {
+			return netip.AddrPort{}, err
+		}
+		defer conn.Close()
+		return mdns.Find(ctx, conn, blackmagic.Service, blackmagic.Advertised(p.ID))
+	}}
+	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: cam, Precondition: cam}, nil
 }
 
 // settings is the keys of one [[camera]] table. take removes the ones read;
@@ -331,9 +384,9 @@ func parseCameras(tables []map[string]any) ([]camera, error) {
 			}
 			c.Kind = body
 		case "blackmagic":
-			phone := blackmagicPhone{Address: s.take("address")}
-			if _, _, err := net.SplitHostPort(phone.Address); err != nil {
-				kindErr = fmt.Errorf("address %q is not the phone's HTTP server address and port", phone.Address)
+			phone := blackmagicPhone{ID: s.take("id"), Interface: s.take("interface")}
+			if phone.ID == "" || phone.Interface == "" {
+				kindErr = errors.New("a Blackmagic camera needs its id and interface")
 			}
 			c.Kind = phone
 		case "":
