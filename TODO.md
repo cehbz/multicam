@@ -20,9 +20,9 @@ Design and findings: KB node `projects/multicam.md`.
 4. Run the `scripts/phone-run.sh --foreground` deploy.
 5. Whether the RX10M4 keeps `startLiveview` listed while live (measured on
    the RX100M6 only).
-6. A brief app switch on the Pixel 9 closes Blackmagic's server; the
-   camera's one try comes at once and is refused, so the user has to
-   Connect again. Design point to raise.
+6. Close the idle TCP connection to the Pixel 9's port 4444 that stays
+   open after Disconnect (lead: the Blackmagic client's transport sets no
+   `IdleConnTimeout`).
 7. `TestSupervisorResetsTheCountAfterALongRun` failed once under load
    (14 starts, want 10; 0 of ~42 reruns). `date +%s` truncation lets a
    stalled quick run measure 2 s against the 2 s threshold. Print the
