@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -26,6 +29,11 @@ type fake struct {
 	recording  bool
 	livestream string // status of /livestreams/0
 	fail       string // "METHOD path" answered with 500
+
+	// active is the active platform's JSON and platforms each custom
+	// platform's XML by name, each replaced by a PUT.
+	active    string
+	platforms map[string]string
 
 	// pushes are record states and streamPushes livestream statuses, each
 	// with its own bitrate, delivered on the event socket after the
@@ -65,9 +73,28 @@ func (f *fake) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 		return
 	}
+	if name, ok := strings.CutPrefix(path, CustomPlatformsPath+"/"); ok {
+		f.platform(w, r, name)
+		return
+	}
 	switch call {
-	case "POST " + RecordPath, "POST " + StopPath, "PUT " + LivestreamStartPath:
+	case "POST " + RecordPath, "POST " + StopPath, "PUT " + LivestreamStartPath, "PUT " + LivestreamStopPath:
 		w.WriteHeader(http.StatusNoContent)
+	case "GET " + ActivePlatformPath:
+		f.mu.Lock()
+		fmt.Fprint(w, f.active)
+		f.mu.Unlock()
+	case "PUT " + ActivePlatformPath:
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.active = string(body)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	case "GET " + CustomPlatformsPath:
+		f.mu.Lock()
+		names := slices.Sorted(maps.Keys(f.platforms))
+		f.mu.Unlock()
+		json.NewEncoder(w).Encode(names)
 	case "GET " + RecordPath:
 		fmt.Fprintf(w, `{"recording": %v, "clipName": null}`, recording)
 	case "GET " + LivestreamPath:
@@ -76,6 +103,26 @@ func (f *fake) serve(w http.ResponseWriter, r *http.Request) {
 		f.events(w, r)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// platform answers a GET of the custom platform name with its XML and
+// replaces it with a PUT's body.
+func (f *fake) platform(w http.ResponseWriter, r *http.Request, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	xml, ok := f.platforms[name]
+	switch {
+	case !ok:
+		http.NotFound(w, r)
+	case r.Method == http.MethodGet:
+		fmt.Fprint(w, xml)
+	case r.Method == http.MethodPut:
+		body, _ := io.ReadAll(r.Body)
+		f.platforms[name] = string(body)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -314,5 +361,149 @@ func TestAdvertisedMatchesTheAppsUniqueID(t *testing.T) {
 	}
 	if Advertised("0000")(txt) {
 		t.Errorf("the app's TXT matches another unique id")
+	}
+}
+
+// activePlatform is the active platform's JSON as the app answers it, with
+// url its URL.
+func activePlatform(url string) string {
+	return `{
+    "platform": "Blackmagic Cam App SRT",
+    "server": "Custom",
+    "key": "",
+    "passphrase": "",
+    "quality": "MEDIUM",
+    "url": "` + url + `"
+}`
+}
+
+// customPlatform is a custom platform's XML as the app answers it, named
+// name, its one server at url, &-escaped.
+func customPlatform(name, url string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?><streaming>
+  <service>
+    <name>` + name + `</name>
+    <servers>
+      <server>
+        <name>Pixel 3</name>
+        <url>` + strings.ReplaceAll(url, "&", "&amp;") + `</url>
+      </server>
+    </servers>
+    <profiles default="Streaming Medium">
+      <profile>
+        <name>Streaming Medium</name>
+        <config resolution="720p" fps="30" codec="H264">
+          <bitrate>2500000</bitrate>
+          <audio-bitrate>128000</audio-bitrate>
+        </config>
+      </profile>
+    </profiles>
+  </service>
+</streaming>
+`
+}
+
+const (
+	staleURL = "srt://192.168.1.116:8890?streamid=publish:pixel9&pkt_size=1316"
+	thisURL  = "srt://192.168.1.109:8890?streamid=publish:pixel9&pkt_size=1316"
+	otherURL = "srt://192.168.1.50:8890?streamid=publish:other&pkt_size=1316"
+)
+
+// pointedFake is an app streaming to staleURL through the active platform
+// and the custom platform "Blackmagic Cam App", with another custom platform
+// "Other" at otherURL.
+func pointedFake(t *testing.T, livestream string) *fake {
+	f := newFake(t)
+	f.livestream = livestream
+	f.active = activePlatform(staleURL)
+	f.platforms = map[string]string{
+		"Blackmagic Cam App": customPlatform("Blackmagic Cam App", staleURL),
+		"Other":              customPlatform("Other", otherURL),
+	}
+	return f
+}
+
+// Active is the active platform's JSON.
+func (f *fake) Active() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.active
+}
+
+// Platform is the custom platform name's XML.
+func (f *fake) Platform(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.platforms[name]
+}
+
+// decoded is the JSON text as a map.
+func decoded(t *testing.T, text string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(text), &m); err != nil {
+		t.Fatalf("%v: %s", err, text)
+	}
+	return m
+}
+
+func TestPointLivestreamRepointsTheActivePlatformAndItsCustomPlatform(t *testing.T) {
+	f := pointedFake(t, StatusStreaming)
+	if err := NewCamera(f.Address()).PointLivestream(t.Context(), thisURL); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := decoded(t, f.Active()), decoded(t, activePlatform(thisURL)); !reflect.DeepEqual(got, want) {
+		t.Errorf("active platform %v, want %v", got, want)
+	}
+	if got, want := f.Platform("Blackmagic Cam App"), customPlatform("Blackmagic Cam App", thisURL); got != want {
+		t.Errorf("custom platform\n%s\nwant\n%s", got, want)
+	}
+	if got, want := f.Platform("Other"), customPlatform("Other", otherURL); got != want {
+		t.Errorf("other custom platform\n%s\nwant\n%s", got, want)
+	}
+	want := []string{
+		"GET /livestreams/0/activePlatform",
+		"GET /livestreams/customPlatforms",
+		"GET /livestreams/customPlatforms/Blackmagic Cam App",
+		"PUT /livestreams/customPlatforms/Blackmagic Cam App",
+		"GET /livestreams/customPlatforms/Other",
+		"PUT /livestreams/0/activePlatform",
+		"GET /livestreams/0",
+		"PUT /livestreams/0/stop",
+	}
+	if got := f.Calls(); !slices.Equal(got, want) {
+		t.Errorf("calls\n%v\nwant\n%v", got, want)
+	}
+}
+
+func TestPointLivestreamChangesNothingWhenItIsPointedAlready(t *testing.T) {
+	f := pointedFake(t, StatusStreaming)
+	if err := NewCamera(f.Address()).PointLivestream(t.Context(), staleURL); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.Calls(), []string{"GET /livestreams/0/activePlatform"}; !slices.Equal(got, want) {
+		t.Errorf("calls %v, want %v", got, want)
+	}
+}
+
+func TestPointLivestreamLeavesAnIdleLivestream(t *testing.T) {
+	f := pointedFake(t, StatusIdle)
+	if err := NewCamera(f.Address()).PointLivestream(t.Context(), thisURL); err != nil {
+		t.Fatal(err)
+	}
+	if calls := f.Calls(); slices.Contains(calls, "PUT /livestreams/0/stop") {
+		t.Errorf("an idle livestream was stopped: calls %v", calls)
+	}
+}
+
+func TestPointLivestreamFailsWithAFailedCall(t *testing.T) {
+	f := pointedFake(t, StatusStreaming)
+	f.fail = "PUT /livestreams/0/activePlatform"
+	err := NewCamera(f.Address()).PointLivestream(t.Context(), thisURL)
+	if err == nil || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("PointLivestream = %v, want the call's HTTP 500", err)
+	}
+	if calls := f.Calls(); slices.Contains(calls, "PUT /livestreams/0/stop") {
+		t.Errorf("livestream stopped after a failure: calls %v", calls)
 	}
 }

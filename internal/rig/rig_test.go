@@ -2,6 +2,7 @@ package rig
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -329,6 +331,9 @@ func TestBlackmagicPhoneIsStreamedUnderItsName(t *testing.T) {
 	if cam.Name != "pixel9" || cam.Camera == nil || cam.Link != nil {
 		t.Errorf("camera %#v, want pixel9 with a camera and no link", cam)
 	}
+	if bc, ok := cam.Camera.(*blackmagicCamera); !ok || bc.path != "pixel9" || bc.source == nil {
+		t.Errorf("camera %#v, want its livestream published under pixel9 from a route's source", cam.Camera)
+	}
 }
 
 func TestBlackmagicPhoneWaitsToBeFound(t *testing.T) {
@@ -351,7 +356,7 @@ func foundAt(t *testing.T, addr string) func(context.Context) (netip.AddrPort, e
 }
 
 func TestBlackmagicCameraIsNotReachedBeforeItIsFound(t *testing.T) {
-	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t))}
+	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t).addr)}
 	if err := cam.StartRecording(t.Context()); err == nil || err.Error() != "Blackmagic Camera not found" {
 		t.Errorf("StartRecording = %v, want not found", err)
 	}
@@ -361,7 +366,7 @@ func TestBlackmagicCameraIsNotReachedBeforeItIsFound(t *testing.T) {
 }
 
 func TestBlackmagicCameraIsReachedWhereItWasFound(t *testing.T) {
-	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t))}
+	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t).addr)}
 	if err := cam.Wait(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -381,15 +386,47 @@ func TestBlackmagicCameraWaitEndsWithTheFindsError(t *testing.T) {
 	}
 }
 
-// phoneApp is Blackmagic Camera's HTTP server as a watch uses it: idle, and
-// pushing each of statuses as its livestream's status once subscribed.
-func phoneApp(t *testing.T, statuses ...string) string {
+// app is Blackmagic Camera's HTTP server as a try uses it: idle, its
+// livestream's active platform at staleURL, and pushing each of statuses as
+// its livestream's status once subscribed.
+type app struct {
+	addr string // host:port
+
+	mu  sync.Mutex
+	url string // the active platform's
+}
+
+// staleURL is where an app's livestream points before a try points it.
+const staleURL = "srt://192.168.1.116:8890?streamid=publish:pixel9&pkt_size=1316"
+
+// URL is the active platform's URL.
+func (a *app) URL() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.url
+}
+
+func phoneApp(t *testing.T, statuses ...string) *app {
 	t.Helper()
+	a := &app{url: staleURL}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch strings.TrimPrefix(r.URL.Path, blackmagic.BasePath) {
-		case blackmagic.RecordPath:
+		switch r.Method + " " + strings.TrimPrefix(r.URL.Path, blackmagic.BasePath) {
+		case "GET " + blackmagic.RecordPath:
 			fmt.Fprint(w, `{"recording": false}`)
-		case blackmagic.EventPath:
+		case "GET " + blackmagic.LivestreamPath:
+			fmt.Fprint(w, `{"status": "Idle"}`)
+		case "GET " + blackmagic.CustomPlatformsPath:
+			fmt.Fprint(w, `[]`)
+		case "GET " + blackmagic.ActivePlatformPath:
+			json.NewEncoder(w).Encode(map[string]string{"platform": "Blackmagic Cam App SRT", "server": "Custom", "url": a.URL()})
+		case "PUT " + blackmagic.ActivePlatformPath:
+			var active struct{ URL string }
+			json.NewDecoder(r.Body).Decode(&active)
+			a.mu.Lock()
+			a.url = active.URL
+			a.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case "GET " + blackmagic.EventPath:
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
@@ -408,11 +445,46 @@ func phoneApp(t *testing.T, statuses ...string) string {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return strings.TrimPrefix(srv.URL, "https://")
+	a.addr = strings.TrimPrefix(srv.URL, "https://")
+	return a
+}
+
+// thisPhone is a source that has this phone at 192.168.1.109 on every route.
+func thisPhone(netip.Addr) (netip.Addr, error) { return netip.MustParseAddr("192.168.1.109"), nil }
+
+func TestBlackmagicCameraPointsItsLivestreamAtThisPhone(t *testing.T) {
+	a := phoneApp(t)
+	var dst netip.Addr
+	source := func(d netip.Addr) (netip.Addr, error) { dst = d; return thisPhone(d) }
+	cam := &blackmagicCamera{find: foundAt(t, a.addr), source: source, path: "pixel9"}
+	if err := cam.Wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cam.Watch(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if want := netip.MustParseAddr("127.0.0.1"); dst != want {
+		t.Errorf("source of the route to %v, want to %v", dst, want)
+	}
+	if got, want := a.URL(), "srt://192.168.1.109:8890?streamid=publish:pixel9&pkt_size=1316"; got != want {
+		t.Errorf("livestream URL %q, want %q", got, want)
+	}
+}
+
+func TestBlackmagicCameraWatchFailsWithoutARouteToIt(t *testing.T) {
+	want := errors.New("route to 127.0.0.1: network is unreachable")
+	noRoute := func(netip.Addr) (netip.Addr, error) { return netip.Addr{}, want }
+	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t).addr), source: noRoute, path: "pixel9"}
+	if err := cam.Wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if ch, err := cam.Watch(t.Context()); !errors.Is(err, want) {
+		t.Errorf("Watch = %v, %v; want %v", ch, err, want)
+	}
 }
 
 func TestBlackmagicPhonesPictureCanBePlayedWhileItStreams(t *testing.T) {
-	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t, "Connecting", "Streaming", "Idle"))}
+	cam := &blackmagicCamera{find: foundAt(t, phoneApp(t, "Connecting", "Streaming", "Idle").addr), source: thisPhone, path: "pixel9"}
 	if err := cam.Wait(t.Context()); err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,7 @@ package mediamtx
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,4 +123,13 @@ func running(proc, path string) []int {
 		}
 	}
 	return pids
+}
+
+// SRTPort is MediaMTX's SRT port, its default.
+const SRTPort = 8890
+
+// PublishURL is the SRT URL a camera publishes its stream at, to the MediaMTX
+// at addr under path.
+func PublishURL(addr netip.Addr, path string) string {
+	return "srt://" + netip.AddrPortFrom(addr, SRTPort).String() + "?streamid=publish:" + path + "&pkt_size=1316"
 }

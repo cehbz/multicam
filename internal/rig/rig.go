@@ -191,10 +191,14 @@ var errNotFound = errors.New("Blackmagic Camera not found")
 
 // blackmagicCamera is a phone running Blackmagic Camera as the console
 // watches it: its try awaits finding the app's HTTP server on the network
-// with find, and it is reached at the address found last; its picture is
-// playable while its livestream is streaming.
+// with find, and it is reached at the address found last; its watch points
+// its livestream at MediaMTX under path on this phone, at source's address
+// on its route to the app; its picture is playable while its livestream is
+// streaming.
 type blackmagicCamera struct {
-	find func(ctx context.Context) (netip.AddrPort, error)
+	find   func(ctx context.Context) (netip.AddrPort, error)
+	source func(dst netip.Addr) (netip.Addr, error)
+	path   string
 
 	mu   sync.Mutex
 	addr netip.AddrPort     // where it was found last
@@ -217,18 +221,18 @@ func (c *blackmagicCamera) Wait(ctx context.Context) error {
 
 func (*blackmagicCamera) String() string { return "Blackmagic Camera" }
 
-// found is the app's HTTP server where it was found last.
-func (c *blackmagicCamera) found() (*blackmagic.Camera, error) {
+// found is the app's HTTP server where it was found last, and that address.
+func (c *blackmagicCamera) found() (*blackmagic.Camera, netip.AddrPort, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cam == nil {
-		return nil, errNotFound
+		return nil, netip.AddrPort{}, errNotFound
 	}
-	return c.cam, nil
+	return c.cam, c.addr, nil
 }
 
 func (c *blackmagicCamera) StartRecording(ctx context.Context) error {
-	cam, err := c.found()
+	cam, _, err := c.found()
 	if err != nil {
 		return err
 	}
@@ -236,7 +240,7 @@ func (c *blackmagicCamera) StartRecording(ctx context.Context) error {
 }
 
 func (c *blackmagicCamera) StopRecording(ctx context.Context) error {
-	cam, err := c.found()
+	cam, _, err := c.found()
 	if err != nil {
 		return err
 	}
@@ -244,8 +248,15 @@ func (c *blackmagicCamera) StopRecording(ctx context.Context) error {
 }
 
 func (c *blackmagicCamera) Watch(ctx context.Context) (<-chan console.Status, error) {
-	cam, err := c.found()
+	cam, addr, err := c.found()
 	if err != nil {
+		return nil, err
+	}
+	src, err := c.source(addr.Addr())
+	if err != nil {
+		return nil, err
+	}
+	if err := cam.PointLivestream(ctx, mediamtx.PublishURL(src, c.path)); err != nil {
 		return nil, err
 	}
 	return watch(ctx, cam.Watch, func(s blackmagic.State) console.Status {
@@ -255,22 +266,23 @@ func (c *blackmagicCamera) Watch(ctx context.Context) (<-chan console.Status, er
 
 // blackmagicPhone is a phone running Blackmagic Camera (kind "blackmagic"):
 // the app's unique id and the interface its HTTP server is found on over
-// mDNS. Its picture is the app's livestream, which the page plays from
-// MediaMTX under the camera's name.
+// mDNS. Its picture is the app's livestream, which it publishes to MediaMTX
+// on this phone and the page plays from MediaMTX, under the camera's name.
 type blackmagicPhone struct {
 	ID        string
 	Interface string
 }
 
 func (p blackmagicPhone) open(name string, _ func() (*link.Keeper, error)) (console.Named, error) {
-	cam := &blackmagicCamera{find: func(ctx context.Context) (netip.AddrPort, error) {
+	find := func(ctx context.Context) (netip.AddrPort, error) {
 		conn, err := mdns.Listen(p.Interface)
 		if err != nil {
 			return netip.AddrPort{}, err
 		}
 		defer conn.Close()
 		return mdns.Find(ctx, conn, blackmagic.Service, blackmagic.Advertised(p.ID))
-	}}
+	}
+	cam := &blackmagicCamera{find: find, source: link.Source, path: name}
 	return console.Named{Name: name, Picture: console.Streamed{Path: name}, Camera: cam, Precondition: cam}, nil
 }
 

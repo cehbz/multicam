@@ -3,14 +3,18 @@
 package blackmagic
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -28,6 +32,9 @@ const (
 	EventPath           = "/event/websocket"
 	LivestreamPath      = "/livestreams/0"
 	LivestreamStartPath = "/livestreams/0/start"
+	LivestreamStopPath  = "/livestreams/0/stop"
+	ActivePlatformPath  = "/livestreams/0/activePlatform"
+	CustomPlatformsPath = "/livestreams/customPlatforms"
 )
 
 // Livestream statuses: StatusIdle when no stream is running, StatusStreaming
@@ -63,23 +70,31 @@ func (c *Camera) url(scheme, path string) string {
 // call sends method to path and returns the body of a 2xx answer. Any other
 // answer is an error naming the HTTP status.
 func (c *Camera) call(ctx context.Context, method, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.url("https", path), nil)
+	return c.send(ctx, method, path, "", nil)
+}
+
+// send is call with body, of type contentType, as the request's body.
+func (c *Camera) send(ctx context.Context, method, path, contentType string, body []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.url("https", path), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	answer, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("%s %s: HTTP %s", method, path, resp.Status)
 	}
-	return body, nil
+	return answer, nil
 }
 
 // StartRecording starts recording a clip.
@@ -218,6 +233,92 @@ func (c *Camera) Watch(ctx context.Context) (<-chan State, error) {
 		}
 	}()
 	return ch, nil
+}
+
+// PointLivestream points the livestream at to, an SRT URL: the active
+// platform's URL and each custom platform server's URL that was the active
+// platform's become to, and a livestream running then is stopped, for Watch
+// to start it again. Nothing changes when the active platform's URL is to.
+func (c *Camera) PointLivestream(ctx context.Context, to string) error {
+	body, err := c.call(ctx, http.MethodGet, ActivePlatformPath)
+	if err != nil {
+		return err
+	}
+	var active map[string]json.RawMessage
+	if err := json.Unmarshal(body, &active); err != nil {
+		return fmt.Errorf("GET %s: %w", ActivePlatformPath, err)
+	}
+	var from string
+	if err := json.Unmarshal(active["url"], &from); err != nil {
+		return fmt.Errorf("GET %s: url: %w", ActivePlatformPath, err)
+	}
+	if from == to {
+		return nil
+	}
+	if err := c.repointCustomPlatforms(ctx, from, to); err != nil {
+		return err
+	}
+	active["url"] = marshal(to)
+	if _, err := c.send(ctx, http.MethodPut, ActivePlatformPath, "application/json", marshal(active)); err != nil {
+		return err
+	}
+	body, err = c.call(ctx, http.MethodGet, LivestreamPath)
+	if err != nil {
+		return err
+	}
+	var ls livestream
+	if err := json.Unmarshal(body, &ls); err != nil {
+		return fmt.Errorf("GET %s: %w", LivestreamPath, err)
+	}
+	if ls.Status == StatusIdle {
+		return nil
+	}
+	_, err = c.call(ctx, http.MethodPut, LivestreamStopPath)
+	return err
+}
+
+// repointCustomPlatforms makes each custom platform server's URL that is
+// from to, leaving the rest of each platform's XML as it is.
+func (c *Camera) repointCustomPlatforms(ctx context.Context, from, to string) error {
+	body, err := c.call(ctx, http.MethodGet, CustomPlatformsPath)
+	if err != nil {
+		return err
+	}
+	var names []string
+	if err := json.Unmarshal(body, &names); err != nil {
+		return fmt.Errorf("GET %s: %w", CustomPlatformsPath, err)
+	}
+	stale, fresh := []byte("<url>"+xmlText(from)+"</url>"), []byte("<url>"+xmlText(to)+"</url>")
+	for _, name := range names {
+		path := CustomPlatformsPath + "/" + url.PathEscape(name)
+		doc, err := c.call(ctx, http.MethodGet, path)
+		if err != nil {
+			return err
+		}
+		if !bytes.Contains(doc, stale) {
+			continue
+		}
+		if _, err := c.send(ctx, http.MethodPut, path, "application/xml", bytes.ReplaceAll(doc, stale, fresh)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// xmlText is s escaped as XML character data.
+func xmlText(s string) string {
+	var b strings.Builder
+	xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
+
+// marshal is v as JSON, with & < > left as they are.
+func marshal(v any) []byte {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	enc.Encode(v)
+	return b.Bytes()
 }
 
 // Service is the DNS-SD service type the app advertises its HTTP server

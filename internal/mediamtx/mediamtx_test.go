@@ -1,6 +1,7 @@
 package mediamtx
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -174,5 +175,12 @@ func TestRunFailsWhenTheLogCannotBeOpened(t *testing.T) {
 	defer cancel()
 	if err := s.Run(ctx); err == nil {
 		t.Error("Run returned nil, want the log error")
+	}
+}
+
+func TestPublishURLIsSRTToItsPath(t *testing.T) {
+	got := PublishURL(netip.MustParseAddr("192.168.1.109"), "pixel9")
+	if want := "srt://192.168.1.109:8890?streamid=publish:pixel9&pkt_size=1316"; got != want {
+		t.Errorf("PublishURL = %q, want %q", got, want)
 	}
 }

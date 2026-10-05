@@ -74,6 +74,19 @@ func (s System) AwaitRadio(ctx context.Context) error {
 	})
 }
 
+// Source is the phone's source address on its route to dst.
+func Source(dst netip.Addr) (netip.Addr, error) {
+	routes, err := rtnl.RouteGet(dst.AsSlice())
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("route to %s: %w", dst, err)
+	}
+	if len(routes) == 0 || routes[0].Src == nil {
+		return netip.Addr{}, fmt.Errorf("route to %s: no source address", dst)
+	}
+	src, _ := netip.AddrFromSlice(routes[0].Src)
+	return src.Unmap(), nil
+}
+
 // await returns once holds reports true, checked at once and again at each
 // message the kernel sends to groups of the netlink protocol, or with ctx's
 // error once ctx ends.
