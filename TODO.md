@@ -48,6 +48,11 @@ Regroup after these. Candidates:
 - Exposure, focus and zoom controls (probe both bodies in Manual mode first
   for `setShutterSpeed`, `setFNumber`, `setFocusMode`).
 - Multi-hour power (dummy batteries in the cameras, the phone on a charger).
+  The RX100M6's other path is micro-USB from the power bank with its own
+  battery in and the door shut; its gauge falls on USB power, but the
+  supply current was never measured. Meter the micro-USB feed while it
+  records to see whether the supply is the limit (the Spark Analyzer can
+  feed and log it through a USB pigtail on its terminal block).
 
 ## Nice to have
 - Both cameras on one 2.4 GHz channel, so their liveview isn't time-sliced:
